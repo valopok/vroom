@@ -49,6 +49,9 @@ impl<T> Dma<T> {
     }
 }
 
+unsafe impl<T> Send for Dma<T> {}
+unsafe impl<T> Sync for Dma<T> {}
+
 impl<T> Deref for Dma<T> {
     type Target = T;
     fn deref(&self) -> &Self::Target {
