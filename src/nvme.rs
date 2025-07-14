@@ -377,16 +377,19 @@ impl<A: Allocator> NvmeDevice<A> {
         self.namespaces.keys().copied().collect()
     }
 
+    pub fn namespace(&self, namespace_id: &NamespaceId) -> Result<&Namespace, Box<dyn Error>> {
+        self.namespaces
+            .get(namespace_id)
+            .ok_or(format!("The namespace with ID {} does not exist", namespace_id.0).into())
+    }
+
     /// Create a pair consisting of 1 submission and 1 completion queue.
     pub fn create_io_queue_pair(
         &mut self,
         namespace_id: NamespaceId,
         number_of_queue_entries: u32,
     ) -> Result<IoQueuePair<A>, Box<dyn Error>> {
-        let namespace = *self.namespaces.get(&namespace_id).ok_or(format!(
-            "The namespace with ID {} does not exist.",
-            namespace_id.0
-        ))?;
+        let namespace = *self.namespace(&namespace_id)?;
 
         // Simple way to avoid collisions while reusing some previously deleted keys.
         let mut index_option = None;
@@ -480,7 +483,10 @@ impl<A: Allocator> NvmeDevice<A> {
     }
 
     // TODO: test
-    pub fn clear_namespace(&mut self, namespace_id_option: Option<NamespaceId>) -> Result<(), Box<dyn Error>> {
+    pub fn clear_namespace(
+        &mut self,
+        namespace_id_option: Option<NamespaceId>,
+    ) -> Result<(), Box<dyn Error>> {
         let namespace_id = if let Some(namespace_id) = namespace_id_option {
             assert!(self.namespaces.contains_key(&namespace_id));
             namespace_id
