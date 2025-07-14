@@ -61,6 +61,10 @@ pub struct IoQueuePair<A: Allocator> {
 }
 
 impl<A: Allocator> IoQueuePair<A> {
+    pub fn id(&self) -> IoQueuePairId {
+        self.id
+    }
+
     /// This method allocates an aligned buffer and copies the content from the provided `buffer`
     /// into it. The contents are then written to the device at the `logical_block_address`.
     pub fn write_copied(
@@ -106,10 +110,7 @@ impl<A: Allocator> IoQueuePair<A> {
         )?;
 
         let prp_1 = prp_container.prp_1() as u64;
-        let prp_2 = prp_container
-            .prp_2()
-            .map(|prp_2| prp_2 as u64)
-            .unwrap_or(0);
+        let prp_2 = prp_container.prp_2().map(|prp_2| prp_2 as u64).unwrap_or(0);
         let blocks = aligned_buffer.len() as u64 / self.namespace.block_size;
 
         let entry = NvmeCommand::io_write(
@@ -182,10 +183,7 @@ impl<A: Allocator> IoQueuePair<A> {
         )?;
 
         let prp_1 = prp_container.prp_1() as u64;
-        let prp_2 = prp_container
-            .prp_2()
-            .map(|prp_2| prp_2 as u64)
-            .unwrap_or(0);
+        let prp_2 = prp_container.prp_2().map(|prp_2| prp_2 as u64).unwrap_or(0);
         let blocks = aligned_buffer.len() as u64 / self.namespace.block_size;
 
         let entry = NvmeCommand::io_read(
