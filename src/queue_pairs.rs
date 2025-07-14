@@ -45,7 +45,7 @@ impl AdminQueuePair {
 }
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
-pub(crate) struct IoQueuePairId(pub u16);
+pub struct IoQueuePairId(pub u16);
 
 #[derive(Debug)]
 pub struct IoQueuePair<A: Allocator> {
