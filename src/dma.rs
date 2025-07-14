@@ -62,27 +62,15 @@ impl<T> DerefMut for Dma<T> {
     }
 }
 
-impl Index<usize> for Dma<u8> {
-    type Output = u8;
+impl<T> Index<usize> for Dma<T> {
+    type Output = T;
     fn index(&self, index: usize) -> &Self::Output {
         assert!(index < self.size, "Index out of bounds");
-        unsafe { &*self.virtual_address.add(index * core::mem::size_of::<u8>()) }
+        unsafe { &*self.virtual_address.add(index) }
     }
 }
 
-impl Index<usize> for Dma<u64> {
-    type Output = u64;
-    fn index(&self, index: usize) -> &Self::Output {
-        assert!(index < self.size, "Index out of bounds");
-        unsafe {
-            &*self
-                .virtual_address
-                .add(index)
-        }
-    }
-}
-
-impl IndexMut<usize> for Dma<u64> {
+impl<T> IndexMut<usize> for Dma<T> {
     fn index_mut(&mut self, index: usize) -> &mut Self::Output {
         assert!(index < self.size, "Index out of bounds");
         unsafe {

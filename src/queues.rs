@@ -4,15 +4,9 @@ use alloc::boxed::Box;
 use core::error::Error;
 use core::hint::spin_loop;
 
-// TODO: don't hardcode this value, but get it from the controller instead
-/// maximum amount of submission queue entries on a 2 MiB huge page
-pub(crate) const MAX_SUB_QUEUE_ENTRIES: usize = 1024;
-
-/// Submission queue
 #[derive(Debug)]
 pub(crate) struct SubmissionQueue {
-    // TODO: switch to mempool for larger queue
-    commands: Dma<[NvmeCommand; MAX_SUB_QUEUE_ENTRIES]>,
+    commands: Dma<NvmeCommand>,
     pub(crate) head: usize,
     pub(crate) tail: usize,
     len: usize,
@@ -20,10 +14,9 @@ pub(crate) struct SubmissionQueue {
     pub(crate) doorbell: usize,
 }
 
-/// Completion queue
 #[derive(Debug)]
 pub(crate) struct CompletionQueue {
-    commands: Dma<[CompletionQueueEntry; MAX_SUB_QUEUE_ENTRIES]>,
+    commands: Dma<CompletionQueueEntry>,
     head: usize,
     phase: bool,
     len: usize,
@@ -57,7 +50,7 @@ impl SubmissionQueue {
             commands: Dma::allocate(number_of_queue_entries, page_size, allocator)?,
             head: 0,
             tail: 0,
-            len: number_of_queue_entries.min(MAX_SUB_QUEUE_ENTRIES),
+            len: number_of_queue_entries,
             doorbell,
         })
     }
@@ -106,7 +99,7 @@ impl CompletionQueue {
             commands: Dma::allocate(number_of_queue_entries, page_size, allocator)?,
             head: 0,
             phase: true,
-            len: number_of_queue_entries.min(MAX_SUB_QUEUE_ENTRIES),
+            len: number_of_queue_entries,
             doorbell,
         })
     }
