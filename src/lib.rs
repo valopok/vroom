@@ -20,7 +20,7 @@ use core::error::Error;
 
 #[cfg(feature = "std")]
 pub use huge_tables::{HugePageAllocator, HUGE_PAGE_SIZE};
-pub use nvme::{ControllerInformation, NvmeDevice, NvmeNamespace};
+pub use nvme::{ControllerInformation, NvmeDevice, Namespace, NamespaceId};
 pub use queue_pairs::{IoQueuePair, IoQueuePairId};
 pub use dma::Allocator;
 

@@ -16,7 +16,11 @@ pub fn main() -> Result<(), Box<dyn Error>> {
 
     let mut nvme = vroom::new_pci_and_huge(&pci_addr)?;
 
-    let namespace_id = 1;
+    let namespace_ids = nvme.namespace_ids();
+    let namespace_id = namespace_ids
+        .first()
+        .expect("No namespaces exist.")
+        .to_owned();
     let queue_capacity = nvme
         .controller_information()
         .maximum_queue_entries_supported;
@@ -60,33 +64,3 @@ pub fn main() -> Result<(), Box<dyn Error>> {
 
     Ok(())
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

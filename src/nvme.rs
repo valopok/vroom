@@ -41,7 +41,7 @@ pub struct NvmeDevice<A> {
     admin_queue_pair: AdminQueuePair,
     io_queue_pair_ids: Vec<IoQueuePairId>,
     information: ControllerInformation,
-    namespaces: HashMap<u32, NvmeNamespace, RandomState>,
+    namespaces: HashMap<NamespaceId, Namespace, RandomState>,
     buffer: Dma<u8>,
 }
 
@@ -319,7 +319,8 @@ impl<A: Allocator> NvmeDevice<A> {
             .iter()
             .copied()
             .take_while(|&id| id != 0)
-            .collect::<Vec<u32>>();
+            .map(|id| NamespaceId(id))
+            .collect::<Vec<NamespaceId>>();
         debug!("{namespace_ids:?}");
 
         debug!("Identify individual namespaces");
@@ -327,7 +328,7 @@ impl<A: Allocator> NvmeDevice<A> {
         let mut namespaces = HashMap::with_hasher(RandomState::with_seeds(0, 0, 0, 0));
         for namespace_id in namespace_ids {
             admin_queue_pair.submit_and_complete(
-                |c_id, address| NvmeCommand::identify_namespace(c_id, address, namespace_id),
+                |c_id, address| NvmeCommand::identify_namespace(c_id, address, namespace_id.0),
                 &buffer,
                 address,
                 doorbell_stride,
@@ -346,7 +347,7 @@ impl<A: Allocator> NvmeDevice<A> {
             };
 
             // TODO: check metadata?
-            let namespace = NvmeNamespace {
+            let namespace = Namespace {
                 id: namespace_id,
                 blocks: namespace_data.namespace_capacity,
                 block_size,
@@ -372,18 +373,19 @@ impl<A: Allocator> NvmeDevice<A> {
         &self.information
     }
 
-    pub fn namespace_ids(&self) -> Vec<u32> {
+    pub fn namespace_ids(&self) -> Vec<NamespaceId> {
         self.namespaces.keys().copied().collect()
     }
 
     /// Create a pair consisting of 1 submission and 1 completion queue.
     pub fn create_io_queue_pair(
         &mut self,
-        namespace_id: u32,
+        namespace_id: NamespaceId,
         number_of_queue_entries: u32,
     ) -> Result<IoQueuePair<A>, Box<dyn Error>> {
         let namespace = *self.namespaces.get(&namespace_id).ok_or(format!(
-            "The namespace with ID {namespace_id} does not exist."
+            "The namespace with ID {} does not exist.",
+            namespace_id.0
         ))?;
 
         // Simple way to avoid collisions while reusing some previously deleted keys.
@@ -478,15 +480,15 @@ impl<A: Allocator> NvmeDevice<A> {
     }
 
     // TODO: test
-    pub fn clear_namespace(&mut self, ns_id: Option<u32>) -> Result<(), Box<dyn Error>> {
-        let ns_id = if let Some(ns_id) = ns_id {
-            assert!(self.namespaces.contains_key(&ns_id));
-            ns_id
+    pub fn clear_namespace(&mut self, namespace_id_option: Option<NamespaceId>) -> Result<(), Box<dyn Error>> {
+        let namespace_id = if let Some(namespace_id) = namespace_id_option {
+            assert!(self.namespaces.contains_key(&namespace_id));
+            namespace_id
         } else {
-            0xFFFF_FFFF
+            NamespaceId(0xFFFF_FFFF)
         };
         self.admin_queue_pair.submit_and_complete(
-            |c_id, _| NvmeCommand::format_nvm(c_id, ns_id),
+            |command_id, _| NvmeCommand::format_nvm(command_id, namespace_id.0),
             &self.buffer,
             self.address,
             self.doorbell_stride,
@@ -576,9 +578,12 @@ fn set_register_64(
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct NamespaceId(pub u32);
+
 #[derive(Debug, Clone, Copy)]
-pub struct NvmeNamespace {
-    pub id: u32,
+pub struct Namespace {
+    pub id: NamespaceId,
     pub blocks: u64,
     pub block_size: u64,
 }

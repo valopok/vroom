@@ -1,6 +1,6 @@
 use crate::cmd::NvmeCommand;
 use crate::dma::{Allocator, Dma};
-use crate::nvme::NvmeNamespace;
+use crate::nvme::Namespace;
 use crate::prp;
 use crate::queues::*;
 use alloc::boxed::Box;
@@ -55,7 +55,7 @@ pub struct IoQueuePair<A: Allocator> {
     pub(crate) page_size: usize,
     pub(crate) maximum_transfer_size: usize,
     pub(crate) allocator: Arc<A>,
-    pub(crate) namespace: NvmeNamespace,
+    pub(crate) namespace: Namespace,
     pub(crate) device_address: *mut u8,
     pub(crate) doorbell_stride: u16,
 }
@@ -114,7 +114,7 @@ impl<A: Allocator> IoQueuePair<A> {
 
         let entry = NvmeCommand::io_write(
             self.submission.tail as u16,
-            self.namespace.id,
+            self.namespace.id.0,
             logical_block_address,
             blocks as u16 - 1,
             prp_1,
@@ -190,7 +190,7 @@ impl<A: Allocator> IoQueuePair<A> {
 
         let entry = NvmeCommand::io_read(
             self.submission.tail as u16,
-            self.namespace.id,
+            self.namespace.id.0,
             logical_block_address,
             blocks as u16 - 1,
             prp_1,
