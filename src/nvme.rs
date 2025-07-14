@@ -452,7 +452,7 @@ impl<A: Allocator> NvmeDevice<A> {
             maximum_transfer_size: self.information.maximum_transfer_size,
             allocator: self.allocator.clone(),
             namespace,
-            device_address: self.address,
+            device_address: self.address as usize,
             doorbell_stride: self.doorbell_stride,
         };
         self.io_queue_pair_ids.push(queue_id);

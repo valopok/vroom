@@ -56,7 +56,7 @@ pub struct IoQueuePair<A: Allocator> {
     pub(crate) maximum_transfer_size: usize,
     pub(crate) allocator: Arc<A>,
     pub(crate) namespace: Namespace,
-    pub(crate) device_address: *mut u8,
+    pub(crate) device_address: usize,
     pub(crate) doorbell_stride: u16,
 }
 
@@ -127,7 +127,7 @@ impl<A: Allocator> IoQueuePair<A> {
         set_submission_queue_tail_doorbell(
             self.id.0,
             tail as u32,
-            self.device_address,
+            self.device_address as *mut u8,
             self.doorbell_stride,
         );
         self.submission.head = self.complete_io(1)? as usize;
@@ -200,7 +200,7 @@ impl<A: Allocator> IoQueuePair<A> {
         set_submission_queue_tail_doorbell(
             self.id.0,
             tail as u32,
-            self.device_address,
+            self.device_address as *mut u8,
             self.doorbell_stride,
         );
         self.submission.head = self.complete_io(1)? as usize;
