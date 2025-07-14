@@ -82,7 +82,8 @@ impl<A: Allocator> NvmeDevice<A> {
         page_size: usize,
         allocator: A,
     ) -> Result<Self, Box<dyn Error>> {
-        // env_logger::init();
+        #[cfg(feature = "std")]
+        env_logger::init();
         // TODO: follow Memory-based Controller Initialization (PCIe) from the NVMe specification
         debug!("Get capabilities");
         let cap = get_register_64(NvmeRegs64::CAP, address, length)?;
