@@ -297,10 +297,9 @@ impl<A: Allocator> NvmeDevice<A> {
             doorbell_stride,
         )?;
         let dword_0 = completion_queue_entry.command_specific;
-        // Not adding one to these, despite them being 0's based values,
-        // because the admin queue pair is excluded.
-        let number_of_io_submission_queues_allocated = dword_0 as u16;
-        let number_of_io_completion_queues_allocated = (dword_0 >> 16) as u16;
+        // Subtracting 1 to account for the admin queue pair.
+        let number_of_io_submission_queues_allocated = dword_0 as u16 - 1;
+        let number_of_io_completion_queues_allocated = (dword_0 >> 16) as u16 - 1;
         debug!(
             "Number of io submission queues allocated: {number_of_io_submission_queues_allocated}"
         );
