@@ -297,9 +297,10 @@ impl<A: Allocator> NvmeDevice<A> {
             doorbell_stride,
         )?;
         let dword_0 = completion_queue_entry.command_specific;
-        // Subtracting 1 to account for the admin queue pair.
-        let number_of_io_submission_queues_allocated = dword_0 as u16 - 1;
-        let number_of_io_completion_queues_allocated = (dword_0 >> 16) as u16 - 1;
+        // Not adding 1 to account for the admin queue pair.
+        // These are normally 0's based values.
+        let number_of_io_submission_queues_allocated = dword_0 as u16;
+        let number_of_io_completion_queues_allocated = (dword_0 >> 16) as u16;
         debug!(
             "Number of io submission queues allocated: {number_of_io_submission_queues_allocated}"
         );
@@ -423,7 +424,7 @@ impl<A: Allocator> NvmeDevice<A> {
 
         // Simple way to avoid collisions while reusing some previously deleted keys.
         let mut index_option = None;
-        for i in 1..self.information.maximum_number_of_io_queue_pairs {
+        for i in 1..=self.information.maximum_number_of_io_queue_pairs {
             if !self.io_queue_pair_ids.contains(&IoQueuePairId(i)) {
                 index_option = Some(IoQueuePairId(i));
                 break;
