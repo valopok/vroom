@@ -415,6 +415,11 @@ impl<A: Allocator> NvmeDevice<A> {
         if number_of_queue_entries < 2 {
             return Err("The number of queue entries must not be smaller than 2.".into());
         }
+        if number_of_queue_entries > self.information.maximum_queue_entries_supported {
+            return Err("The number of queue entries must not be bigger than \
+                the maximum number of supported queue entries."
+                .into());
+        }
         let namespace = *self.namespace(namespace_id)?;
 
         // Simple way to avoid collisions while reusing some previously deleted keys.
