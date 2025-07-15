@@ -16,7 +16,7 @@ use hashbrown::HashMap;
 use log::debug;
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NamespaceId(pub u32);
 
 #[repr(C)]
