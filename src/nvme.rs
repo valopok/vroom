@@ -15,6 +15,18 @@ use core::hint::spin_loop;
 use hashbrown::HashMap;
 use log::debug;
 
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct NamespaceId(pub u32);
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct Namespace {
+    pub id: NamespaceId,
+    pub blocks: u64,
+    pub block_size: u64,
+}
+
 #[derive(Debug)]
 pub struct ControllerInformation {
     pub pci_vendor_id: u16,
@@ -582,16 +594,6 @@ fn set_register_64(
         core::ptr::write_volatile((address as usize + register as usize) as *mut u64, value);
     }
     Ok(())
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct NamespaceId(pub u32);
-
-#[derive(Debug, Clone, Copy)]
-pub struct Namespace {
-    pub id: NamespaceId,
-    pub blocks: u64,
-    pub block_size: u64,
 }
 
 // clippy doesnt like this

@@ -44,6 +44,7 @@ impl AdminQueuePair {
     }
 }
 
+#[repr(C)]
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
 pub struct IoQueuePairId(pub u16);
 
