@@ -179,11 +179,22 @@ impl<A: Allocator> NvmeDevice<A> {
         }
 
         debug!("Configure admin queues");
-        let admin_sq = SubmissionQueue::new(maximum_queue_entries_supported as usize, page_size, 0, &allocator)?;
-        let admin_cq = CompletionQueue::new(maximum_queue_entries_supported as usize, page_size, 0, &allocator)?;
+        let admin_sq = SubmissionQueue::new(
+            maximum_queue_entries_supported as usize,
+            page_size,
+            0,
+            &allocator,
+        )?;
+        let admin_cq = CompletionQueue::new(
+            maximum_queue_entries_supported as usize,
+            page_size,
+            0,
+            &allocator,
+        )?;
         set_register_64(NvmeRegs64::ASQ, admin_sq.get_addr() as u64, address, length)?;
         set_register_64(NvmeRegs64::ACQ, admin_cq.get_addr() as u64, address, length)?;
-        let aqa = (maximum_queue_entries_supported as u32 - 1) << 16 | (maximum_queue_entries_supported as u32 - 1);
+        let aqa = (maximum_queue_entries_supported as u32 - 1) << 16
+            | (maximum_queue_entries_supported as u32 - 1);
         set_register_32(NvmeRegs32::AQA, aqa, address, length)?;
         let mut admin_queue_pair = AdminQueuePair {
             submission: admin_sq,
@@ -401,6 +412,9 @@ impl<A: Allocator> NvmeDevice<A> {
         namespace_id: &NamespaceId,
         number_of_queue_entries: u32,
     ) -> Result<IoQueuePair<A>, Box<dyn Error>> {
+        if number_of_queue_entries < 2 {
+            return Err("The number of queue entries must not be smaller than 2.".into());
+        }
         let namespace = *self.namespace(namespace_id)?;
 
         // Simple way to avoid collisions while reusing some previously deleted keys.
