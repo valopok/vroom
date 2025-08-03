@@ -39,9 +39,6 @@ pub fn main() -> Result<(), Error> {
     let mut dest_2 = [0u8; TEXT.len()];
     io_queue_pair_2.read_copied(&mut dest_2, logical_block_address)?;
 
-    nvme.delete_io_queue_pair(io_queue_pair_1)?;
-    nvme.delete_io_queue_pair(io_queue_pair_2)?;
-
     println!("-----source_1: {}", std::str::from_utf8(&source_1).unwrap());
     println!("destination_1: {}", std::str::from_utf8(&dest_1).unwrap());
     println!("-----source_2: {}", std::str::from_utf8(&source_2).unwrap());
@@ -61,5 +58,5 @@ pub fn main() -> Result<(), Error> {
     //     nvme.delete_io_queue_pair(queue)?;
     // }
 
-    nvme.shutdown()
+    nvme.shutdown(vec!(io_queue_pair_1, io_queue_pair_2))
 }

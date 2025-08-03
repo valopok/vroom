@@ -524,9 +524,33 @@ impl<A: Allocator> NvmeDevice<A> {
         Ok(())
     }
 
-    // TODO: deallocate all prp lists of all IO queues and the device buffer
-    pub fn shutdown(self) -> Result<(), Error> {
-        todo!()
+    /// This initiates a normal Memory-based Controller Shutdown (PCIe).
+    pub fn shutdown(mut self, all_io_queue_pairs: Vec<IoQueuePair<A>>) -> Result<(), Error> {
+        for io_queue_pair in all_io_queue_pairs {
+            self.delete_io_queue_pair(io_queue_pair)?;
+        }
+        self.buffer.deallocate(self.allocator.as_ref())?;
+
+        debug!("Send shutdown signal");
+        let mut cc = get_register_32(NvmeRegs32::CC, self.address, self.length)?;
+        // Set Shutdown (SHN) to 0b01
+        cc &= 0b1111_1111_1111_1111_0111_1111_1111_1111;
+        cc |= 0b0000_0000_0000_0000_0100_0000_0000_0000;
+        set_register_32(NvmeRegs32::CC, cc, self.address, self.length)?;
+
+        // Wait for "shutdown" signal
+        loop {
+            let csts = get_register_32(NvmeRegs32::CSTS, self.address, self.length)?;
+            let shutdown_status = (csts >> 2) & 0b11; // SHST
+            let shutdown_type = csts >> 7; // ST
+            if shutdown_status == 0b10 && shutdown_type == 0 {
+                break;
+            } else {
+                spin_loop();
+            }
+        }
+        debug!("Controller shutdown successful");
+        Ok(())
     }
 
     fn submit_and_complete_admin<F: FnOnce(u16, usize) -> NvmeCommand>(
