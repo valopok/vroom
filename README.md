@@ -1,32 +1,49 @@
 # vroom
-vroom is a userspace NVMe driver written in Rust. It aims to be as fast as the SPDK NVMe driver, while minimizing unsafe code and offering a simplified API. vroom currently serves as a proof of concept. 
 
-[My thesis](https://db.in.tum.de/people/sites/ellmann/theses/finished/24/pirhonen_writing_an_nvme_driver_in_rust.pdf) contains some details about the implementation.
+This is a rewrite of the `vroom` userspace NVMe driver with the following changes:
 
-# Build instructions
-You will need Rust, as well as its package manager `cargo` which you can install with:
-```bash
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-```
+- compilable with `no-std`
+- usable with a custom allocator
+
+The goal of the rewrite is to allow the driver to be used within the
+[Hermit Unikernel](https://github.com/hermit-os/kernel).
+
+[The thesis of the original `vroom` project by Tuomas Pirhonen](https://db.in.tum.de/people/sites/ellmann/theses/finished/24/pirhonen_writing_an_nvme_driver_in_rust.pdf)
+contains some details about the original implementation.
+
+
+## Disclaimer
+
+This is by no means production-ready.  
+Do not use it in critical environments.  
+DMA may corrupt memory.
+
+
+## Build instructions for Linux systems
+
+You will need Rust, as well as its package manager `cargo`.  
+The installation instructions can be found at [rustup.rs](https://rustup.rs/).
 
 Huge pages need to be enabled:
-```bash
+```sh
 cd vroom
 sudo ./setup-hugetlbfs.sh
 ```
 
-To build the driver, as well as any examples run:
-```bash
+Build the driver, as well as any examples:
+```sh
 cargo build --release --all-targets
 ```
 
-e.g. to run the hello world example (root rights are needed for DMA):
-```
-sudo ./target/release/examples/hello_world 0000:00:07.0
+Get the PCI address of an NVMe drive with `lspci`.  
+The address should be formatted as `0000:00:xx.x` for the program.
+
+Run the `std_pci_huge` example (root privileges are needed for DMA):
+```sh
+sudo ./target/release/examples/std_pci_huge 0000:00:08.0
 ```
 
-# Disclaimer
-This is by no means production-ready. Do not use it in critical environments. DMA may corrupt memory.
 
-# Related projects
+## Related projects
+
 - [Redox's NVMe driver](https://gitlab.redox-os.org/redox-os/drivers/-/tree/master/storage/nvmed)
