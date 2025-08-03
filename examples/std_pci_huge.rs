@@ -1,8 +1,7 @@
-use std::error::Error;
 use std::{env, process};
-use vroom::{HugePageAllocator, IoQueuePair};
+use vroom::Error;
 
-pub fn main() -> Result<(), Box<dyn Error>> {
+pub fn main() -> Result<(), Error> {
     let mut args = env::args();
     args.next();
 
@@ -25,8 +24,8 @@ pub fn main() -> Result<(), Box<dyn Error>> {
         .controller_information()
         .maximum_queue_entries_supported;
     let logical_block_address = 0;
-    let mut io_queue_pair_1 = nvme.create_io_queue_pair(namespace_id, queue_capacity)?;
-    let mut io_queue_pair_2 = nvme.create_io_queue_pair(namespace_id, queue_capacity)?;
+    let mut io_queue_pair_1 = nvme.create_io_queue_pair(&namespace_id, queue_capacity)?;
+    let mut io_queue_pair_2 = nvme.create_io_queue_pair(&namespace_id, queue_capacity)?;
 
     const TEXT: &'static str = "Hello, world!";
 
@@ -43,24 +42,24 @@ pub fn main() -> Result<(), Box<dyn Error>> {
     nvme.delete_io_queue_pair(io_queue_pair_1)?;
     nvme.delete_io_queue_pair(io_queue_pair_2)?;
 
-    println!("-----source_1: {}", std::str::from_utf8(&source_1)?);
-    println!("destination_1: {}", std::str::from_utf8(&dest_1)?);
-    println!("-----source_2: {}", std::str::from_utf8(&source_2)?);
-    println!("destination_2: {}", std::str::from_utf8(&dest_2)?);
+    println!("-----source_1: {}", std::str::from_utf8(&source_1).unwrap());
+    println!("destination_1: {}", std::str::from_utf8(&dest_1).unwrap());
+    println!("-----source_2: {}", std::str::from_utf8(&source_2).unwrap());
+    println!("destination_2: {}", std::str::from_utf8(&dest_2).unwrap());
 
-    let max_queues = nvme
-        .controller_information()
-        .maximum_number_of_io_queue_pairs;
-    dbg!(max_queues);
-    dbg!(queue_capacity);
-    let mut queues: Vec<IoQueuePair<HugePageAllocator>> = Vec::new();
-    for _ in 0..max_queues {
-        let queue = nvme.create_io_queue_pair(namespace_id, queue_capacity)?;
-        queues.push(queue);
-    }
-    for queue in queues {
-        nvme.delete_io_queue_pair(queue)?;
-    }
+    // let max_queues = nvme
+    //     .controller_information()
+    //     .maximum_number_of_io_queue_pairs;
+    // dbg!(max_queues);
+    // dbg!(queue_capacity);
+    // let mut queues: Vec<IoQueuePair<HugePageAllocator>> = Vec::new();
+    // for _ in 0..max_queues {
+    //     let queue = nvme.create_io_queue_pair(&namespace_id, queue_capacity)?;
+    //     queues.push(queue);
+    // }
+    // for queue in queues {
+    //     nvme.delete_io_queue_pair(queue)?;
+    // }
 
-    Ok(())
+    nvme.shutdown()
 }

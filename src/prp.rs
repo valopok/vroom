@@ -1,8 +1,7 @@
 use crate::dma::Allocator;
 use crate::dma::Dma;
-use core::error::Error;
+use crate::error::Error;
 use alloc::vec::Vec;
-use alloc::boxed::Box;
 
 // The physical region page list consists of multiple PRP entries.
 // Each entry consists of an address to a region of physical memory and
@@ -42,23 +41,29 @@ pub(crate) fn allocate<A: Allocator>(
     number_of_bytes: usize,
     page_size: usize,
     allocator: &A,
-) -> Result<PrpContainer, Box<dyn Error>> {
+) -> Result<PrpContainer, Error> {
     if (virtual_address as usize & 0b0111) != 0 {
-        return Err("Virtual address is not dword aligned.".into());
+        return Err(Error::VirtualAddressIsNotDwordAligned(
+            virtual_address as usize,
+        ));
     }
-    let prp_1 = allocator.translate_virtual_to_physical(virtual_address)? as *mut u64;
+    let prp_1 = allocator
+        .translate_virtual_to_physical(virtual_address)
+        .map_err(|error| Error::TranslateVirtualToPhysical(error))? as *mut u64;
     let needed_number_of_pages =
         ((virtual_address as usize & (page_size - 1)) + number_of_bytes).div_ceil(page_size);
     if needed_number_of_pages == 1 {
         return Ok(PrpContainer::One(prp_1));
     }
     if (virtual_address as usize & (page_size - 1)) != 0 {
-        return Err("Virtual address is not aligned to page.".into());
+        return Err(Error::VirtualAddressIsNotPageAligned(
+            virtual_address as usize,
+        ));
     }
     // add one page size to the virtual address of PRP1 to get the virtual address of PRP2
     let prp_2 = allocator
-        .translate_virtual_to_physical(unsafe { virtual_address.add(page_size) })?
-        as *mut u64;
+        .translate_virtual_to_physical(unsafe { virtual_address.add(page_size) })
+        .map_err(|error| Error::TranslateVirtualToPhysical(error))? as *mut u64;
     if needed_number_of_pages == 2 {
         return Ok(PrpContainer::Two(prp_1, prp_2));
     }
@@ -92,7 +97,7 @@ pub(crate) fn allocate<A: Allocator>(
 pub(crate) fn deallocate<A: Allocator>(
     prp_container: PrpContainer,
     allocator: &A,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<(), Error> {
     if let PrpContainer::Multiple(_, prp_lists) = prp_container {
         for prp_list in prp_lists {
             prp_list.deallocate(allocator)?;

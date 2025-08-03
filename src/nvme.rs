@@ -1,16 +1,14 @@
 use crate::cmd::{FeatureIdentifier, IdentifyNamespace, NvmeCommand, Select};
 use crate::dma::{Allocator, Dma};
+use crate::error::Error;
 #[cfg(feature = "std")]
 use crate::pci;
 use crate::queue_pairs::{AdminQueuePair, IoQueuePair, IoQueuePairId};
 use crate::queues::*;
 use ahash::RandomState;
-use alloc::boxed::Box;
-use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::error::Error;
 use core::hint::spin_loop;
 use hashbrown::HashMap;
 use log::debug;
@@ -66,7 +64,7 @@ impl<A: Allocator> NvmeDevice<A> {
         pci_address: &str,
         page_size: usize,
         allocator: A,
-    ) -> Result<Self, Box<dyn Error>> {
+    ) -> Result<Self, Error> {
         let mut vendor_file =
             pci::open_resource_readonly(pci_address, "vendor").expect("wrong pci address");
         let mut device_file =
@@ -74,17 +72,22 @@ impl<A: Allocator> NvmeDevice<A> {
         let mut config_file =
             pci::open_resource_readonly(pci_address, "config").expect("wrong pci address");
 
-        let _vendor_id = pci::read_hex(&mut vendor_file)?;
-        let _device_id = pci::read_hex(&mut device_file)?;
-        let class_id = pci::read_io32(&mut config_file, 8)? >> 16;
+        let _vendor_id =
+            pci::read_hex(&mut vendor_file).map_err(|error| Error::UnixPciError(error))?;
+        let _device_id =
+            pci::read_hex(&mut device_file).map_err(|error| Error::UnixPciError(error))?;
+        let class_id = pci::read_io32(&mut config_file, 8)
+            .map_err(|error| Error::UnixPciError(error.into()))?
+            >> 16;
 
         // 0x01 -> mass storage device class id
         // 0x08 -> nvme subclass
         if class_id != 0x0108 {
-            return Err(format!("device {pci_address} is not a block device").into());
+            return Err(Error::NotABlockDevice(pci_address.to_string()));
         }
 
-        let (address, length) = pci::mmap_resource(pci_address)?;
+        let (address, length) =
+            pci::mmap_resource(pci_address).map_err(|error| Error::UnixPciError(error))?;
         NvmeDevice::new(address, length, page_size, allocator)
     }
 
@@ -93,7 +96,7 @@ impl<A: Allocator> NvmeDevice<A> {
         length: usize,
         page_size: usize,
         allocator: A,
-    ) -> Result<Self, Box<dyn Error>> {
+    ) -> Result<Self, Error> {
         #[cfg(feature = "std")]
         env_logger::init();
         // TODO: follow Memory-based Controller Initialization (PCIe) from the NVMe specification
@@ -121,46 +124,40 @@ impl<A: Allocator> NvmeDevice<A> {
         let _nvm_subsystem_shutdown_enhancements_supported = ((cap >> 61) & 0b1) == 1; // NSSES
 
         if maximum_queue_entries_supported == 1 {
-            return Err(
-                "The value of \"Maximum Queue Entries Supported (MQES)\" in the
-                capabilities register (CAP) is invalidly set to 0."
-                    .into(),
-            );
+            return Err(Error::MaximumQueueEntriesSupportedInvalidlyZero);
         }
         if !nvm_command_set_support {
-            return Err("The NVM command set is not supported.".into());
+            return Err(Error::NvmCommandSetNotSupported);
         }
         if minimum_memory_page_size > maximum_memory_page_size {
-            return Err(
-                "The value of \"Memory Page Size Minimum (MPSMIN)\" is bigger than
-                 the value of \"Memory Page Size Maximum (MPSMAX)\" in the capabilities register (CAP)." .into(),
-            );
+            return Err(Error::MemoryPageSizeMinimumBiggerThanMaximum(
+                maximum_memory_page_size,
+                maximum_memory_page_size,
+            ));
         }
 
         let ps_4_kibi_byte = 2usize.pow(12); // the lowest minimum page size
         let ps_128_mebi_byte = 2usize.pow(28); // the highest maximum page size
         if page_size < ps_4_kibi_byte {
-            return Err(
-                "The page size is less than the lowest minimum page size of 4 KiB (2^12 B).".into(),
-            );
+            return Err(Error::PageSizeLessThanNvmeMinimum(page_size));
         }
         if page_size > ps_128_mebi_byte {
-            return Err(
-                "The page size is more than the highest maximum page size of 128 MiB (2^28 B)."
-                    .into(),
-            );
+            return Err(Error::PageSizeMoreThanNvmeMaximum(page_size));
         }
         if (page_size as u64) < minimum_memory_page_size {
-            return Err("The page size used is smaller than the minimum memory page size of the controller.".into());
+            return Err(Error::PageSizeLessThanControllerMinimum(
+                page_size,
+                minimum_memory_page_size,
+            ));
         }
         if page_size as u64 > maximum_memory_page_size {
-            return Err(
-                "The page size used is bigger than the maximum memory page size of the controller."
-                    .into(),
-            );
+            return Err(Error::PageSizeMoreThanControllerMaximum(
+                page_size,
+                maximum_memory_page_size,
+            ));
         }
         if page_size.count_ones() != 1 {
-            return Err("The page size is not a power of two.".into());
+            return Err(Error::PageSizeNotAPowerOfTwo(page_size));
         }
 
         debug!("Disable controller");
@@ -275,10 +272,7 @@ impl<A: Allocator> NvmeDevice<A> {
                 3 => "administrative controller",
                 _ => "unknown",
             };
-            return Err(format!(
-                "The controller type is not \"I/O controller\" but instead \"{type_name}\".",
-            )
-            .into());
+            return Err(Error::ControllerTypeInvalid(type_name.to_string()));
         }
         let maximum_transfer_size = minimum_memory_page_size as usize * maximum_data_transfer_size;
 
@@ -400,10 +394,10 @@ impl<A: Allocator> NvmeDevice<A> {
         self.namespaces.keys().copied().collect()
     }
 
-    pub fn namespace(&self, namespace_id: &NamespaceId) -> Result<&Namespace, Box<dyn Error>> {
+    pub fn namespace(&self, namespace_id: &NamespaceId) -> Result<&Namespace, Error> {
         self.namespaces
             .get(namespace_id)
-            .ok_or(format!("The namespace with ID {} does not exist", namespace_id.0).into())
+            .ok_or(Error::NamespaceDoesNotExist(namespace_id.clone()))
     }
 
     /// Create a pair consisting of 1 submission and 1 completion queue.
@@ -411,14 +405,17 @@ impl<A: Allocator> NvmeDevice<A> {
         &mut self,
         namespace_id: &NamespaceId,
         number_of_queue_entries: u32,
-    ) -> Result<IoQueuePair<A>, Box<dyn Error>> {
+    ) -> Result<IoQueuePair<A>, Error> {
         if number_of_queue_entries < 2 {
-            return Err("The number of queue entries must not be smaller than 2.".into());
+            return Err(Error::NumberOfQueueEntriesLessThanTwo(
+                number_of_queue_entries,
+            ));
         }
         if number_of_queue_entries > self.information.maximum_queue_entries_supported {
-            return Err("The number of queue entries must not be bigger than \
-                the maximum number of supported queue entries."
-                .into());
+            return Err(Error::NumberOfQueueEntriesMoreThanMaximum(
+                number_of_queue_entries,
+                self.information.maximum_queue_entries_supported,
+            ));
         }
         let namespace = *self.namespace(namespace_id)?;
 
@@ -430,7 +427,7 @@ impl<A: Allocator> NvmeDevice<A> {
                 break;
             }
         }
-        let queue_id = index_option.ok_or("Maximum number of queues reached")?;
+        let queue_id = index_option.ok_or(Error::MaximumNumberOfQueuesReached)?;
 
         debug!("Requesting I/O queue pair with ID {}", queue_id.0);
 
@@ -490,19 +487,13 @@ impl<A: Allocator> NvmeDevice<A> {
         Ok(io_queue_pair)
     }
 
-    pub fn delete_io_queue_pair(
-        &mut self,
-        queue_pair: IoQueuePair<A>,
-    ) -> Result<(), Box<dyn Error>> {
+    pub fn delete_io_queue_pair(&mut self, queue_pair: IoQueuePair<A>) -> Result<(), Error> {
         debug!("Deleting I/O queue pair with ID {}", queue_pair.id.0);
         let index = self
             .io_queue_pair_ids
             .iter()
             .position(|id| id == &queue_pair.id)
-            .ok_or(format!(
-                "The I/O queue pair with ID {} does not exist",
-                queue_pair.id.0
-            ))?;
+            .ok_or(Error::IoQueuePairDoesNotExist(queue_pair.id))?;
         self.io_queue_pair_ids.remove(index);
         self.submit_and_complete_admin(|c_id, _| {
             NvmeCommand::delete_io_submission_queue(c_id, queue_pair.id.0)
@@ -517,7 +508,7 @@ impl<A: Allocator> NvmeDevice<A> {
     pub fn clear_namespace(
         &mut self,
         namespace_id_option: Option<NamespaceId>,
-    ) -> Result<(), Box<dyn Error>> {
+    ) -> Result<(), Error> {
         let namespace_id = if let Some(namespace_id) = namespace_id_option {
             assert!(self.namespaces.contains_key(&namespace_id));
             namespace_id
@@ -534,14 +525,14 @@ impl<A: Allocator> NvmeDevice<A> {
     }
 
     // TODO: deallocate all prp lists of all IO queues and the device buffer
-    pub fn shutdown(self) -> Result<(), Box<dyn Error>> {
+    pub fn shutdown(self) -> Result<(), Error> {
         todo!()
     }
 
     fn submit_and_complete_admin<F: FnOnce(u16, usize) -> NvmeCommand>(
         &mut self,
         cmd_init: F,
-    ) -> Result<CompletionQueueEntry, Box<dyn Error>> {
+    ) -> Result<CompletionQueueEntry, Error> {
         self.admin_queue_pair.submit_and_complete(
             cmd_init,
             &self.buffer,
@@ -553,13 +544,9 @@ impl<A: Allocator> NvmeDevice<A> {
 
 /// Gets the value of the register at `address` + `register`.
 /// Returns an error if `address` + `register` does not belong to mapped memory.
-fn get_register_32(
-    register: NvmeRegs32,
-    address: *mut u8,
-    length: usize,
-) -> Result<u32, Box<dyn Error>> {
+fn get_register_32(register: NvmeRegs32, address: *mut u8, length: usize) -> Result<u32, Error> {
     if register as usize > length - 4 {
-        return Err("Memory access out of bounds.".into());
+        return Err(Error::MemoryAccessOutOfBounds);
     }
     let value =
         unsafe { core::ptr::read_volatile((address as usize + register as usize) as *mut u32) };
@@ -568,13 +555,9 @@ fn get_register_32(
 
 /// Gets the value of the register at `address` + `register`.
 /// Returns an error if `address` + `register` does not belong to mapped memory.
-fn get_register_64(
-    register: NvmeRegs64,
-    address: *mut u8,
-    length: usize,
-) -> Result<u64, Box<dyn Error>> {
+fn get_register_64(register: NvmeRegs64, address: *mut u8, length: usize) -> Result<u64, Error> {
     if register as usize > length - 8 {
-        return Err("Memory access out of bounds.".into());
+        return Err(Error::MemoryAccessOutOfBounds);
     }
     let value =
         unsafe { core::ptr::read_volatile((address as usize + register as usize) as *mut u64) };
@@ -588,9 +571,9 @@ fn set_register_32(
     value: u32,
     address: *mut u8,
     length: usize,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<(), Error> {
     if register as usize > length - 4 {
-        return Err("Memory access out of bounds.".into());
+        return Err(Error::MemoryAccessOutOfBounds);
     }
     unsafe {
         core::ptr::write_volatile((address as usize + register as usize) as *mut u32, value);
@@ -605,9 +588,9 @@ fn set_register_64(
     value: u64,
     address: *mut u8,
     length: usize,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<(), Error> {
     if register as usize > length - 8 {
-        return Err("Memory access out of bounds.".into());
+        return Err(Error::MemoryAccessOutOfBounds);
     }
     unsafe {
         core::ptr::write_volatile((address as usize + register as usize) as *mut u64, value);

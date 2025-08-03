@@ -1,5 +1,5 @@
+use crate::error::Error;
 use alloc::boxed::Box;
-use core::error::Error;
 use core::ops::{Deref, DerefMut, Index, IndexMut, Range, RangeFull, RangeInclusive, RangeTo};
 use core::slice;
 
@@ -27,14 +27,18 @@ impl<T> Dma<T> {
         number_of_elements: usize,
         page_size: usize,
         allocator: &A,
-    ) -> Result<Dma<T>, Box<dyn Error>> {
+    ) -> Result<Dma<T>, Error> {
         let layout = core::alloc::Layout::from_size_align(
             core::mem::size_of::<T>() * number_of_elements,
             page_size,
-        )?;
-        let virtual_address = allocator.allocate::<T>(layout)?;
-        let physical_address =
-            allocator.translate_virtual_to_physical(virtual_address as *mut T)?;
+        )
+        .map_err(|error| Error::Layout(error))?;
+        let virtual_address = allocator
+            .allocate::<T>(layout)
+            .map_err(|error| Error::Allocate(error))?;
+        let physical_address = allocator
+            .translate_virtual_to_physical(virtual_address as *mut T)
+            .map_err(|error| Error::TranslateVirtualToPhysical(error))?;
         let dma = Dma {
             virtual_address: virtual_address as *mut T,
             physical_address: physical_address as *mut T,
@@ -43,9 +47,11 @@ impl<T> Dma<T> {
         Ok(dma)
     }
 
-    pub(crate) fn deallocate<A: Allocator>(self, allocator: &A) -> Result<(), Box<dyn Error>> {
+    pub(crate) fn deallocate<A: Allocator>(self, allocator: &A) -> Result<(), Error> {
         let slice = core::ptr::slice_from_raw_parts_mut(self.virtual_address, self.size);
-        allocator.deallocate(slice)
+        allocator
+            .deallocate(slice)
+            .map_err(|error| Error::Deallocate(error))
     }
 }
 
@@ -76,11 +82,7 @@ impl<T> Index<usize> for Dma<T> {
 impl<T> IndexMut<usize> for Dma<T> {
     fn index_mut(&mut self, index: usize) -> &mut Self::Output {
         assert!(index < self.size, "Index out of bounds");
-        unsafe {
-            &mut *self
-                .virtual_address
-                .add(index)
-        }
+        unsafe { &mut *self.virtual_address.add(index) }
     }
 }
 

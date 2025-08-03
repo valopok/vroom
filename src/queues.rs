@@ -1,7 +1,6 @@
 use crate::cmd::NvmeCommand;
 use crate::dma::{Allocator, Dma};
-use alloc::boxed::Box;
-use core::error::Error;
+use crate::error::Error;
 use core::hint::spin_loop;
 
 #[derive(Debug)]
@@ -45,7 +44,7 @@ impl SubmissionQueue {
         page_size: usize,
         doorbell: usize,
         allocator: &A,
-    ) -> Result<Self, Box<dyn Error>> {
+    ) -> Result<Self, Error> {
         Ok(Self {
             commands: Dma::allocate(number_of_queue_entries, page_size, allocator)?,
             head: 0,
@@ -66,9 +65,9 @@ impl SubmissionQueue {
     }
 
     #[allow(dead_code)]
-    pub(crate) fn submit_checked(&mut self, entry: NvmeCommand) -> Result<usize, Box<dyn Error>> {
+    pub(crate) fn submit_checked(&mut self, entry: NvmeCommand) -> Result<usize, Error> {
         if self.is_full() {
-            Err("Submission queue is full.".into())
+            Err(Error::SubmissionQueueFull)
         } else {
             Ok(self.submit(entry))
         }
@@ -94,7 +93,7 @@ impl CompletionQueue {
         page_size: usize,
         doorbell: usize,
         allocator: &A,
-    ) -> Result<Self, Box<dyn Error>> {
+    ) -> Result<Self, Error> {
         Ok(Self {
             commands: Dma::allocate(number_of_queue_entries, page_size, allocator)?,
             head: 0,
@@ -105,7 +104,7 @@ impl CompletionQueue {
     }
 
     #[inline(always)]
-    pub(crate) fn complete(&mut self) -> Result<(usize, CompletionQueueEntry, usize), Box<dyn Error>> {
+    pub(crate) fn complete(&mut self) -> Result<(usize, CompletionQueueEntry, usize), Error> {
         let entry = &self.commands[self.head];
 
         if ((entry.status & 1) == 1) == self.phase {
@@ -116,7 +115,7 @@ impl CompletionQueue {
             }
             Ok((self.head, *entry, prev))
         } else {
-            Err("CompletionQueue.complete()".into())
+            Err(Error::CompletionQueueCompletionFailure)
         }
     }
 

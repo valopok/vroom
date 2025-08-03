@@ -2,6 +2,7 @@
 #![cfg_attr(target_arch = "aarch64", feature(stdarch_arm_hints))]
 mod cmd;
 mod dma;
+mod error;
 #[cfg(feature = "std")]
 mod huge_tables;
 mod nvme;
@@ -15,19 +16,15 @@ extern crate alloc;
 #[cfg(feature = "std")]
 extern crate std;
 
-use alloc::boxed::Box;
-use core::error::Error;
-
+pub use dma::Allocator;
+pub use error::Error;
 #[cfg(feature = "std")]
 pub use huge_tables::{HugePageAllocator, HUGE_PAGE_SIZE};
-pub use nvme::{ControllerInformation, NvmeDevice, Namespace, NamespaceId};
+pub use nvme::{ControllerInformation, Namespace, NamespaceId, NvmeDevice};
 pub use queue_pairs::{IoQueuePair, IoQueuePairId};
-pub use dma::Allocator;
 
 #[cfg(feature = "std")]
-pub fn new_pci_and_huge(
-    pci_address: &str,
-) -> Result<NvmeDevice<HugePageAllocator>, Box<dyn Error>> {
+pub fn new_pci_and_huge(pci_address: &str) -> Result<NvmeDevice<HugePageAllocator>, Error> {
     let allocator = HugePageAllocator {};
     let nvme = NvmeDevice::from_pci_address(pci_address, HUGE_PAGE_SIZE, allocator)?;
     Ok(nvme)

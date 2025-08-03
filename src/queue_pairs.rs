@@ -1,13 +1,11 @@
 use crate::cmd::NvmeCommand;
 use crate::dma::{Allocator, Dma};
+use crate::error::Error;
 use crate::nvme::Namespace;
 use crate::prp;
 use crate::queues::*;
-use alloc::boxed::Box;
-use alloc::format;
 use alloc::sync::Arc;
 use core::alloc::Layout;
-use core::error::Error;
 
 #[derive(Debug)]
 pub(crate) struct AdminQueuePair {
@@ -22,7 +20,7 @@ impl AdminQueuePair {
         buffer: &Dma<u8>,
         address: *mut u8,
         doorbell_stride: u16,
-    ) -> Result<CompletionQueueEntry, Box<dyn Error>> {
+    ) -> Result<CompletionQueueEntry, Error> {
         let cid = self.submission.tail;
         let tail = self
             .submission
@@ -33,12 +31,7 @@ impl AdminQueuePair {
         set_completion_queue_head_doorbell(0, head as u32, address, doorbell_stride);
         let status = entry.status >> 1;
         if status != 0 {
-            return Err(format!(
-                "Requesting i/o completion queue failed with status code 0x{:X} and type 0x{:X}",
-                status & 0xFF,
-                (status >> 8) & 0x7
-            )
-            .into());
+            return Err(Error::IoCompletionQueueFailure(status));
         }
         Ok(entry)
     }
@@ -68,16 +61,19 @@ impl<A: Allocator> IoQueuePair<A> {
 
     /// This method allocates an aligned buffer and copies the content from the provided `buffer`
     /// into it. The contents are then written to the device at the `logical_block_address`.
-    pub fn write_copied(
-        &mut self,
-        buffer: &[u8],
-        logical_block_address: u64,
-    ) -> Result<(), Box<dyn Error>> {
+    pub fn write_copied(&mut self, buffer: &[u8], logical_block_address: u64) -> Result<(), Error> {
         if buffer.len() > self.maximum_transfer_size {
-            return Err("The buffer length is bigger than the maximum transfer size.".into());
+            return Err(Error::BufferLengthBiggerThanMaximumTransferSize(
+                buffer.len(),
+                self.maximum_transfer_size,
+            ));
         }
-        let layout = Layout::from_size_align(buffer.len(), self.page_size)?;
-        let aligned_buffer = self.allocator.allocate::<u8>(layout)?;
+        let layout = Layout::from_size_align(buffer.len(), self.page_size)
+            .map_err(|error| Error::Layout(error))?;
+        let aligned_buffer = self
+            .allocator
+            .allocate::<u8>(layout)
+            .map_err(|error| Error::Allocate(error))?;
         let aligned_buffer = unsafe {
             core::slice::from_raw_parts_mut(aligned_buffer as *mut u8, aligned_buffer.len())
         };
@@ -95,12 +91,18 @@ impl<A: Allocator> IoQueuePair<A> {
         &mut self,
         aligned_buffer: &[u8],
         logical_block_address: u64,
-    ) -> Result<(), Box<dyn Error>> {
+    ) -> Result<(), Error> {
         if aligned_buffer.len() > self.maximum_transfer_size {
-            return Err("The buffer length is bigger than the maximum transfer size.".into());
+            return Err(Error::BufferLengthBiggerThanMaximumTransferSize(
+                aligned_buffer.len(),
+                self.maximum_transfer_size,
+            ));
         }
         if aligned_buffer.len() as u64 % self.namespace.block_size != 0 {
-            return Err("The buffer length is not a multiple of the namespace block size".into());
+            return Err(Error::BufferLengthNotAMultipleOfNamespaceBlockSize(
+                aligned_buffer.len(),
+                self.namespace.block_size,
+            ));
         }
 
         let prp_container = prp::allocate(
@@ -144,12 +146,19 @@ impl<A: Allocator> IoQueuePair<A> {
         &mut self,
         buffer: &mut [u8],
         logical_block_address: u64,
-    ) -> Result<(), Box<dyn Error>> {
+    ) -> Result<(), Error> {
         if buffer.len() > self.maximum_transfer_size {
-            return Err("The buffer length is bigger than the maximum transfer size.".into());
+            return Err(Error::BufferLengthBiggerThanMaximumTransferSize(
+                buffer.len(),
+                self.maximum_transfer_size,
+            ));
         }
-        let layout = Layout::from_size_align(buffer.len(), self.page_size)?;
-        let aligned_buffer = self.allocator.allocate::<u8>(layout)?;
+        let layout = Layout::from_size_align(buffer.len(), self.page_size)
+            .map_err(|error| Error::Layout(error))?;
+        let aligned_buffer = self
+            .allocator
+            .allocate::<u8>(layout)
+            .map_err(|error| Error::Allocate(error))?;
         let aligned_buffer = unsafe {
             core::slice::from_raw_parts_mut(aligned_buffer as *mut u8, aligned_buffer.len())
         };
@@ -168,12 +177,18 @@ impl<A: Allocator> IoQueuePair<A> {
         &mut self,
         aligned_buffer: &mut [u8],
         logical_block_address: u64,
-    ) -> Result<(), Box<dyn Error>> {
+    ) -> Result<(), Error> {
         if aligned_buffer.len() > self.maximum_transfer_size {
-            return Err("The buffer length is bigger than the maximum transfer size.".into());
+            return Err(Error::BufferLengthBiggerThanMaximumTransferSize(
+                aligned_buffer.len(),
+                self.maximum_transfer_size,
+            ));
         }
         if aligned_buffer.len() as u64 % self.namespace.block_size != 0 {
-            return Err("The buffer length is not a multiple of the namespace block size".into());
+            return Err(Error::BufferLengthNotAMultipleOfNamespaceBlockSize(
+                aligned_buffer.len(),
+                self.namespace.block_size,
+            ));
         }
 
         let prp_container = prp::allocate(
@@ -210,7 +225,7 @@ impl<A: Allocator> IoQueuePair<A> {
         Ok(())
     }
 
-    fn complete_io(&mut self, n: usize) -> Result<u16, Box<dyn Error>> {
+    fn complete_io(&mut self, n: usize) -> Result<u16, Error> {
         assert!(n > 0);
         let (tail, completion_queue_entry, _) = self.completion.complete_n(n);
         unsafe {
@@ -219,19 +234,13 @@ impl<A: Allocator> IoQueuePair<A> {
         self.submission.head = completion_queue_entry.sq_head as usize;
         let status = completion_queue_entry.status >> 1;
         if status != 0 {
-            return Err(format!(
-                "Status: 0x{:x}, Status Code 0x{:x}, Status Code Type: 0x{:x}",
-                status,
-                status & 0xFF,
-                (status >> 8) & 0x7
-            )
-            .into());
+            return Err(Error::IoCompletionQueueFailure(status));
         }
         Ok(completion_queue_entry.sq_head)
     }
 
     // TODO: test
-    pub fn quick_poll(&mut self) -> Result<(), Box<dyn Error>> {
+    pub fn quick_poll(&mut self) -> Result<(), Error> {
         let (tail, completion_queue_entry, _) = self.completion.complete()?;
         unsafe {
             core::ptr::write_volatile(self.completion.doorbell as *mut u32, tail as u32);
@@ -239,13 +248,7 @@ impl<A: Allocator> IoQueuePair<A> {
         self.submission.head = completion_queue_entry.sq_head as usize;
         let status = completion_queue_entry.status >> 1;
         if status != 0 {
-            return Err(format!(
-                "Status: 0x{:x}, Status Code 0x{:x}, Status Code Type: 0x{:x}",
-                status,
-                status & 0xFF,
-                (status >> 8) & 0x7
-            )
-            .into());
+            return Err(Error::IoCompletionQueueFailure(status));
         }
         Ok(())
     }
