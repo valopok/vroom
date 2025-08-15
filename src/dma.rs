@@ -16,42 +16,56 @@ pub trait Allocator {
 }
 
 #[derive(Debug)]
-pub(crate) struct Dma<T> {
-    pub(crate) virtual_address: *mut T,
-    pub(crate) physical_address: *mut T,
-    pub(crate) size: usize,
+pub struct Dma<T> {
+    virtual_address: *mut T,
+    physical_address: *mut T,
+    number_of_elements: usize,
+    size: usize,
 }
 
 impl<T> Dma<T> {
+    pub(crate) fn virtual_address(&self) -> *mut T {
+        self.virtual_address
+    }
+    pub(crate) fn physical_address(&self) -> *mut T {
+        self.physical_address
+    }
+    pub fn number_of_elements(&self) -> usize {
+        self.number_of_elements
+    }
+    pub fn size(&self) -> usize {
+        self.size
+    }
+
     pub(crate) fn allocate<A: Allocator>(
         number_of_elements: usize,
         page_size: usize,
         allocator: &A,
     ) -> Result<Dma<T>, Error> {
-        let layout = core::alloc::Layout::from_size_align(
-            core::mem::size_of::<T>() * number_of_elements,
-            page_size,
-        )
-        .map_err(|error| Error::Layout(error))?;
+        let size = core::mem::size_of::<T>() * number_of_elements;
+        let layout = core::alloc::Layout::from_size_align(size, page_size)
+            .map_err(Error::Layout)?;
         let virtual_address = allocator
             .allocate::<T>(layout)
-            .map_err(|error| Error::Allocate(error))?;
+            .map_err(Error::Allocate)?;
         let physical_address = allocator
             .translate_virtual_to_physical(virtual_address as *mut T)
-            .map_err(|error| Error::TranslateVirtualToPhysical(error))?;
+            .map_err(Error::TranslateVirtualToPhysical)?;
         let dma = Dma {
             virtual_address: virtual_address as *mut T,
             physical_address: physical_address as *mut T,
-            size: number_of_elements,
+            number_of_elements,
+            size,
         };
         Ok(dma)
     }
 
     pub(crate) fn deallocate<A: Allocator>(self, allocator: &A) -> Result<(), Error> {
-        let slice = core::ptr::slice_from_raw_parts_mut(self.virtual_address, self.size);
+        let slice =
+            core::ptr::slice_from_raw_parts_mut(self.virtual_address, self.number_of_elements);
         allocator
             .deallocate(slice)
-            .map_err(|error| Error::Deallocate(error))
+            .map_err(Error::Deallocate)
     }
 }
 
@@ -74,14 +88,14 @@ impl<T> DerefMut for Dma<T> {
 impl<T> Index<usize> for Dma<T> {
     type Output = T;
     fn index(&self, index: usize) -> &Self::Output {
-        assert!(index < self.size, "Index out of bounds");
+        assert!(index < self.number_of_elements, "Index out of bounds");
         unsafe { &*self.virtual_address.add(index) }
     }
 }
 
 impl<T> IndexMut<usize> for Dma<T> {
     fn index_mut(&mut self, index: usize) -> &mut Self::Output {
-        assert!(index < self.size, "Index out of bounds");
+        assert!(index < self.number_of_elements, "Index out of bounds");
         unsafe { &mut *self.virtual_address.add(index) }
     }
 }
@@ -89,7 +103,7 @@ impl<T> IndexMut<usize> for Dma<T> {
 impl Index<Range<usize>> for Dma<u8> {
     type Output = [u8];
     fn index(&self, index: Range<usize>) -> &Self::Output {
-        assert!(index.end <= self.size, "Index out of bounds");
+        assert!(index.end <= self.number_of_elements, "Index out of bounds");
         unsafe {
             slice::from_raw_parts(
                 self.virtual_address.add(index.start),
@@ -101,7 +115,7 @@ impl Index<Range<usize>> for Dma<u8> {
 
 impl IndexMut<Range<usize>> for Dma<u8> {
     fn index_mut(&mut self, index: Range<usize>) -> &mut Self::Output {
-        assert!(index.end <= self.size, "Index out of bounds");
+        assert!(index.end <= self.number_of_elements, "Index out of bounds");
         unsafe {
             slice::from_raw_parts_mut(
                 self.virtual_address.add(index.start),
@@ -140,13 +154,13 @@ impl IndexMut<RangeInclusive<usize>> for Dma<u8> {
 impl Index<RangeFull> for Dma<u8> {
     type Output = [u8];
     fn index(&self, _: RangeFull) -> &Self::Output {
-        &self[0..self.size]
+        &self[0..self.number_of_elements]
     }
 }
 
 impl IndexMut<RangeFull> for Dma<u8> {
     fn index_mut(&mut self, _: RangeFull) -> &mut Self::Output {
-        let len = self.size;
+        let len = self.number_of_elements;
         &mut self[0..len]
     }
 }

@@ -83,7 +83,7 @@ impl SubmissionQueue {
     }
 
     pub(crate) fn get_addr(&self) -> usize {
-        self.commands.physical_address as usize
+        self.commands.physical_address() as usize
     }
 }
 
@@ -143,6 +143,6 @@ impl CompletionQueue {
     }
 
     pub(crate) fn get_addr(&self) -> usize {
-        self.commands.physical_address as usize
+        self.commands.physical_address() as usize
     }
 }

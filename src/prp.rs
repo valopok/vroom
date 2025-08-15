@@ -31,39 +31,36 @@ impl PrpContainer {
         match self {
             PrpContainer::One(_) => None,
             PrpContainer::Two(_, prp_2) => Some(*prp_2),
-            PrpContainer::Multiple(_, prp_lists) => Some(prp_lists[0].physical_address),
+            PrpContainer::Multiple(_, prp_lists) => Some(prp_lists[0].physical_address()),
         }
     }
 }
 
-pub(crate) fn allocate<A: Allocator>(
-    virtual_address: *const u8,
-    number_of_bytes: usize,
+pub(crate) fn allocate<A: Allocator, T>(
+    buffer: &Dma<T>,
     page_size: usize,
     allocator: &A,
 ) -> Result<PrpContainer, Error> {
-    if (virtual_address as usize & 0b0111) != 0 {
+    if (buffer.virtual_address() as usize & 0b0111) != 0 {
         return Err(Error::VirtualAddressIsNotDwordAligned(
-            virtual_address as usize,
+            buffer.virtual_address() as usize,
         ));
     }
-    let prp_1 = allocator
-        .translate_virtual_to_physical(virtual_address)
-        .map_err(|error| Error::TranslateVirtualToPhysical(error))? as *mut u64;
+    let prp_1 = buffer.physical_address() as *mut u64;
     let needed_number_of_pages =
-        ((virtual_address as usize & (page_size - 1)) + number_of_bytes).div_ceil(page_size);
+        ((buffer.virtual_address() as usize & (page_size - 1)) + buffer.size()).div_ceil(page_size);
     if needed_number_of_pages == 1 {
         return Ok(PrpContainer::One(prp_1));
     }
-    if (virtual_address as usize & (page_size - 1)) != 0 {
+    if (buffer.virtual_address() as usize & (page_size - 1)) != 0 {
         return Err(Error::VirtualAddressIsNotPageAligned(
-            virtual_address as usize,
+            buffer.virtual_address() as usize,
         ));
     }
     // add one page size to the virtual address of PRP1 to get the virtual address of PRP2
     let prp_2 = allocator
-        .translate_virtual_to_physical(unsafe { virtual_address.add(page_size) })
-        .map_err(|error| Error::TranslateVirtualToPhysical(error))? as *mut u64;
+        .translate_virtual_to_physical(unsafe { buffer.virtual_address().add(page_size) })
+        .map_err(Error::TranslateVirtualToPhysical)? as *mut u64;
     if needed_number_of_pages == 2 {
         return Ok(PrpContainer::Two(prp_1, prp_2));
     }
@@ -87,7 +84,7 @@ pub(crate) fn allocate<A: Allocator>(
         }
         // last list should not point to another list
         if i < needed_number_of_prp_lists - 1 {
-            prp_lists[i][prp_entries_per_page - 1] = prp_lists[i + 1].physical_address as u64;
+            prp_lists[i][prp_entries_per_page - 1] = prp_lists[i + 1].physical_address() as u64;
         }
     }
 

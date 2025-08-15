@@ -29,6 +29,7 @@ pub enum Error {
     UnixPciError(Box<dyn core::error::Error>),
     VirtualAddressIsNotDwordAligned(usize),
     VirtualAddressIsNotPageAligned(usize),
+    NumberOfElementsIsZero,
     BufferLengthBiggerThanMaximumTransferSize(usize, usize),
     BufferLengthNotAMultipleOfNamespaceBlockSize(usize, u64),
     IoCompletionQueueFailure(u16),
@@ -96,6 +97,9 @@ impl fmt::Display for Error {
             ),
             Error::VirtualAddressIsNotPageAligned(address) => write!(f,
                 "The virtual address {address:X} is not page aligned."
+            ),
+            Error::NumberOfElementsIsZero => write!(f,
+                "The provided number of elements is 0."
             ),
             Error::BufferLengthBiggerThanMaximumTransferSize(buffer_length, maximum_transfer_size) => write!(f,
                 "The buffer length ({buffer_length:X}) is bigger than the maximum transfer size ({maximum_transfer_size:X})."

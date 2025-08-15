@@ -16,7 +16,7 @@ extern crate alloc;
 #[cfg(feature = "std")]
 extern crate std;
 
-pub use dma::Allocator;
+pub use dma::{Allocator, Dma};
 pub use error::Error;
 #[cfg(feature = "std")]
 pub use huge_tables::{HugePageAllocator, HUGE_PAGE_SIZE};

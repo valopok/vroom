@@ -28,35 +28,33 @@ pub fn main() -> Result<(), Error> {
     let mut io_queue_pair_2 = nvme.create_io_queue_pair(&namespace_id, queue_capacity)?;
 
     const TEXT: &'static str = "Hello, world!";
+    const LENGTH: usize = TEXT.len();
 
-    let source_1 = TEXT.as_bytes();
-    io_queue_pair_1.write_copied(&source_1, logical_block_address)?;
-    let mut dest_1 = [0u8; TEXT.len()];
-    io_queue_pair_1.read_copied(&mut dest_1, logical_block_address)?;
+    let mut source_1 = io_queue_pair_1.allocate_buffer(LENGTH)?;
+    let mut dest_1 = io_queue_pair_1.allocate_buffer(LENGTH)?;
+    for (i, byte) in TEXT.bytes().enumerate() {
+        source_1[i] = byte;
+    }
+    io_queue_pair_1.write(&source_1, logical_block_address)?;
+    io_queue_pair_1.read(&mut dest_1, logical_block_address)?;
 
-    let source_2 = TEXT.as_bytes();
-    io_queue_pair_2.write_copied(&source_2, logical_block_address)?;
-    let mut dest_2 = [0u8; TEXT.len()];
-    io_queue_pair_2.read_copied(&mut dest_2, logical_block_address)?;
+    let mut source_2 = io_queue_pair_2.allocate_buffer(TEXT.len())?;
+    let mut dest_2 = io_queue_pair_2.allocate_buffer(TEXT.len())?;
+    for (i, byte) in TEXT.bytes().enumerate() {
+        source_2[i] = byte;
+    }
+    io_queue_pair_2.write(&source_2, logical_block_address)?;
+    io_queue_pair_2.read(&mut dest_2, logical_block_address)?;
 
-    println!("-----source_1: {}", std::str::from_utf8(&source_1).unwrap());
-    println!("destination_1: {}", std::str::from_utf8(&dest_1).unwrap());
-    println!("-----source_2: {}", std::str::from_utf8(&source_2).unwrap());
-    println!("destination_2: {}", std::str::from_utf8(&dest_2).unwrap());
+    println!("-----source_1: {}", std::str::from_utf8(&source_1[..]).unwrap());
+    println!("destination_1: {}", std::str::from_utf8(&dest_1[..]).unwrap());
+    println!("-----source_2: {}", std::str::from_utf8(&source_2[..]).unwrap());
+    println!("destination_2: {}", std::str::from_utf8(&dest_2[..]).unwrap());
 
-    // let max_queues = nvme
-    //     .controller_information()
-    //     .maximum_number_of_io_queue_pairs;
-    // dbg!(max_queues);
-    // dbg!(queue_capacity);
-    // let mut queues: Vec<IoQueuePair<HugePageAllocator>> = Vec::new();
-    // for _ in 0..max_queues {
-    //     let queue = nvme.create_io_queue_pair(&namespace_id, queue_capacity)?;
-    //     queues.push(queue);
-    // }
-    // for queue in queues {
-    //     nvme.delete_io_queue_pair(queue)?;
-    // }
+    io_queue_pair_1.deallocate_buffer(source_1)?;
+    io_queue_pair_1.deallocate_buffer(dest_1)?;
+    io_queue_pair_2.deallocate_buffer(source_2)?;
+    io_queue_pair_2.deallocate_buffer(dest_2)?;
 
-    nvme.shutdown(vec!(io_queue_pair_1, io_queue_pair_2))
+    nvme.shutdown(vec![io_queue_pair_1, io_queue_pair_2])
 }

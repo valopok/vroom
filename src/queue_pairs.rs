@@ -5,7 +5,7 @@ use crate::nvme::Namespace;
 use crate::prp;
 use crate::queues::*;
 use alloc::sync::Arc;
-use core::alloc::Layout;
+use log::debug;
 
 #[derive(Debug)]
 pub(crate) struct AdminQueuePair {
@@ -24,7 +24,7 @@ impl AdminQueuePair {
         let cid = self.submission.tail;
         let tail = self
             .submission
-            .submit(cmd_init(cid as u16, buffer.physical_address as usize));
+            .submit(cmd_init(cid as u16, buffer.physical_address() as usize));
         set_submission_queue_tail_doorbell(0, tail as u32, address, doorbell_stride);
 
         let (head, entry, _) = self.completion.complete_spin();
@@ -59,62 +59,47 @@ impl<A: Allocator> IoQueuePair<A> {
         self.id
     }
 
-    /// This method allocates an aligned buffer and copies the content from the provided `buffer`
-    /// into it. The contents are then written to the device at the `logical_block_address`.
-    pub fn write_copied(&mut self, buffer: &[u8], logical_block_address: u64) -> Result<(), Error> {
-        if buffer.len() > self.maximum_transfer_size {
-            return Err(Error::BufferLengthBiggerThanMaximumTransferSize(
-                buffer.len(),
-                self.maximum_transfer_size,
-            ));
+    pub fn allocate_buffer<T>(&self, number_of_elements: usize) -> Result<Dma<T>, Error> {
+        if number_of_elements == 0 {
+            return Err(Error::NumberOfElementsIsZero);
         }
-        let layout = Layout::from_size_align(buffer.len(), self.page_size)
-            .map_err(|error| Error::Layout(error))?;
-        let aligned_buffer = self
-            .allocator
-            .allocate::<u8>(layout)
-            .map_err(|error| Error::Allocate(error))?;
-        let aligned_buffer = unsafe {
-            core::slice::from_raw_parts_mut(aligned_buffer as *mut u8, aligned_buffer.len())
-        };
-        aligned_buffer[0..buffer.len()].copy_from_slice(buffer);
-        self.write(aligned_buffer, logical_block_address)
+        let size = number_of_elements * core::mem::size_of::<T>();
+        debug!("Request buffer with {number_of_elements} elements and size 0x{size:X}.");
+        let block_size = self.namespace.block_size;
+        let next_multiple_of_block_size = size.next_multiple_of(block_size as usize);
+        let number_of_elements = next_multiple_of_block_size / core::mem::size_of::<T>();
+        debug!(
+            "Allocate buffer with {number_of_elements} elements and size 0x{next_multiple_of_block_size:X}."
+        );
+        Dma::allocate(number_of_elements, self.page_size, self.allocator.as_ref())
     }
 
-    /// Write the content of the provided `aligned_buffer` to the device at the `logical_block_address`.
-    /// The `aligned_buffer` needs to be page aligned and its size must not exceed the maximum transfer size.
-    ///
-    /// See core::alloc::Layout for creation of such a buffer.
-    ///
-    /// To use an unaligned buffer, use `write_copied()` instead.
-    pub fn write(
-        &mut self,
-        aligned_buffer: &[u8],
-        logical_block_address: u64,
-    ) -> Result<(), Error> {
-        if aligned_buffer.len() > self.maximum_transfer_size {
+    pub fn deallocate_buffer<T>(&self, buffer: Dma<T>) -> Result<(), Error> {
+        buffer.deallocate(self.allocator.as_ref())
+    }
+
+    /// Write the content of the provided `buffer` to the device at the `logical_block_address`.
+    /// The `buffer` needs to be page aligned,
+    /// its size must be a multiple of the name space block size and not exceed the maximum transfer size.
+    pub fn write<T>(&mut self, buffer: &Dma<T>, logical_block_address: u64) -> Result<(), Error> {
+        if buffer.size() > self.maximum_transfer_size {
             return Err(Error::BufferLengthBiggerThanMaximumTransferSize(
-                aligned_buffer.len(),
+                buffer.size(),
                 self.maximum_transfer_size,
             ));
         }
-        if aligned_buffer.len() as u64 % self.namespace.block_size != 0 {
+        if buffer.size() as u64 % self.namespace.block_size != 0 {
             return Err(Error::BufferLengthNotAMultipleOfNamespaceBlockSize(
-                aligned_buffer.len(),
+                buffer.size(),
                 self.namespace.block_size,
             ));
         }
 
-        let prp_container = prp::allocate(
-            aligned_buffer.as_ptr(),
-            aligned_buffer.len(),
-            self.page_size,
-            self.allocator.as_ref(),
-        )?;
+        let prp_container = prp::allocate(buffer, self.page_size, self.allocator.as_ref())?;
 
         let prp_1 = prp_container.prp_1() as u64;
         let prp_2 = prp_container.prp_2().map(|prp_2| prp_2 as u64).unwrap_or(0);
-        let blocks = aligned_buffer.len() as u64 / self.namespace.block_size;
+        let blocks = buffer.size() as u64 / self.namespace.block_size;
 
         let entry = NvmeCommand::io_write(
             self.submission.tail as u16,
@@ -139,68 +124,32 @@ impl<A: Allocator> IoQueuePair<A> {
         Ok(())
     }
 
-    /// This method allocates an aligned buffer and fills it with data read from the `device` at
-    /// the given `logical_block_address`. The contents of the aligned buffer are then copied to
-    /// the provided `buffer`.
-    pub fn read_copied(
+    /// Fill the provided `buffer` with data read from the device at the `logical_block_address`.
+    /// The `buffer` needs to be page aligned,
+    /// its size must be a multiple of the name space block size and not exceed the maximum transfer size.
+    pub fn read<T>(
         &mut self,
-        buffer: &mut [u8],
+        buffer: &mut Dma<T>,
         logical_block_address: u64,
     ) -> Result<(), Error> {
-        if buffer.len() > self.maximum_transfer_size {
+        if buffer.size() > self.maximum_transfer_size {
             return Err(Error::BufferLengthBiggerThanMaximumTransferSize(
-                buffer.len(),
+                buffer.size(),
                 self.maximum_transfer_size,
             ));
         }
-        let layout = Layout::from_size_align(buffer.len(), self.page_size)
-            .map_err(|error| Error::Layout(error))?;
-        let aligned_buffer = self
-            .allocator
-            .allocate::<u8>(layout)
-            .map_err(|error| Error::Allocate(error))?;
-        let aligned_buffer = unsafe {
-            core::slice::from_raw_parts_mut(aligned_buffer as *mut u8, aligned_buffer.len())
-        };
-        self.read(aligned_buffer, logical_block_address)?;
-        buffer.copy_from_slice(&aligned_buffer[0..buffer.len()]);
-        Ok(())
-    }
-
-    /// Fill the provided `aligned_buffer` with data read from the device at the `logical_block_address`.
-    /// The `aligned_buffer` needs to be page aligned and its size must not exceed the maximum transfer size.
-    ///
-    /// See core::alloc::Layout for creation of such a buffer.
-    ///
-    /// To use an unaligned buffer, use `read_copied()` instead.
-    pub fn read(
-        &mut self,
-        aligned_buffer: &mut [u8],
-        logical_block_address: u64,
-    ) -> Result<(), Error> {
-        if aligned_buffer.len() > self.maximum_transfer_size {
-            return Err(Error::BufferLengthBiggerThanMaximumTransferSize(
-                aligned_buffer.len(),
-                self.maximum_transfer_size,
-            ));
-        }
-        if aligned_buffer.len() as u64 % self.namespace.block_size != 0 {
+        if buffer.size() as u64 % self.namespace.block_size != 0 {
             return Err(Error::BufferLengthNotAMultipleOfNamespaceBlockSize(
-                aligned_buffer.len(),
+                buffer.size(),
                 self.namespace.block_size,
             ));
         }
 
-        let prp_container = prp::allocate(
-            aligned_buffer.as_ptr(),
-            aligned_buffer.len(),
-            self.page_size,
-            self.allocator.as_ref(),
-        )?;
+        let prp_container = prp::allocate(buffer, self.page_size, self.allocator.as_ref())?;
 
         let prp_1 = prp_container.prp_1() as u64;
         let prp_2 = prp_container.prp_2().map(|prp_2| prp_2 as u64).unwrap_or(0);
-        let blocks = aligned_buffer.len() as u64 / self.namespace.block_size;
+        let blocks = buffer.size() as u64 / self.namespace.block_size;
 
         let entry = NvmeCommand::io_read(
             self.submission.tail as u16,

@@ -45,8 +45,8 @@ pub struct ControllerInformation {
 #[derive(Debug)]
 pub struct NvmeDevice<A> {
     allocator: Arc<A>,
-    address: *mut u8,
-    length: usize,
+    address: *mut u8, // BAR address
+    length: usize,    // BAR length
     doorbell_stride: u16,
     admin_queue_pair: AdminQueuePair,
     io_queue_pair_ids: Vec<IoQueuePairId>,
@@ -72,10 +72,8 @@ impl<A: Allocator> NvmeDevice<A> {
         let mut config_file =
             pci::open_resource_readonly(pci_address, "config").expect("wrong pci address");
 
-        let _vendor_id =
-            pci::read_hex(&mut vendor_file).map_err(|error| Error::UnixPciError(error))?;
-        let _device_id =
-            pci::read_hex(&mut device_file).map_err(|error| Error::UnixPciError(error))?;
+        let _vendor_id = pci::read_hex(&mut vendor_file).map_err(Error::UnixPciError)?;
+        let _device_id = pci::read_hex(&mut device_file).map_err(Error::UnixPciError)?;
         let class_id = pci::read_io32(&mut config_file, 8)
             .map_err(|error| Error::UnixPciError(error.into()))?
             >> 16;
@@ -86,8 +84,7 @@ impl<A: Allocator> NvmeDevice<A> {
             return Err(Error::NotABlockDevice(pci_address.to_string()));
         }
 
-        let (address, length) =
-            pci::mmap_resource(pci_address).map_err(|error| Error::UnixPciError(error))?;
+        let (address, length) = pci::mmap_resource(pci_address).map_err(Error::UnixPciError)?;
         NvmeDevice::new(address, length, page_size, allocator)
     }
 
@@ -330,13 +327,16 @@ impl<A: Allocator> NvmeDevice<A> {
             doorbell_stride,
         )?;
         let buffer_as_u32: &[u32] = unsafe {
-            core::slice::from_raw_parts(buffer.virtual_address as *const u32, buffer.size / 4)
+            core::slice::from_raw_parts(
+                buffer.virtual_address() as *const u32,
+                buffer.number_of_elements() / 4,
+            )
         };
         let namespace_ids = buffer_as_u32
             .iter()
             .copied()
             .take_while(|&id| id != 0)
-            .map(|id| NamespaceId(id))
+            .map(NamespaceId)
             .collect::<Vec<NamespaceId>>();
         debug!("{namespace_ids:?}");
 
@@ -352,7 +352,7 @@ impl<A: Allocator> NvmeDevice<A> {
             )?;
 
             let namespace_data: IdentifyNamespace =
-                unsafe { (*(buffer.virtual_address as *const IdentifyNamespace)).clone() };
+                unsafe { (*(buffer.virtual_address() as *const IdentifyNamespace)).clone() };
 
             // figure out block size
             let flba_index = (namespace_data.formatted_lba_size & 0xF) as usize;
@@ -397,7 +397,7 @@ impl<A: Allocator> NvmeDevice<A> {
     pub fn namespace(&self, namespace_id: &NamespaceId) -> Result<&Namespace, Error> {
         self.namespaces
             .get(namespace_id)
-            .ok_or(Error::NamespaceDoesNotExist(namespace_id.clone()))
+            .ok_or(Error::NamespaceDoesNotExist(*namespace_id))
     }
 
     /// Create a pair consisting of 1 submission and 1 completion queue.
