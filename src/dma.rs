@@ -37,17 +37,24 @@ impl<T> Dma<T> {
         self.size
     }
 
+    pub unsafe fn new_uninitialized() -> Dma<T> {
+        Dma {
+            virtual_address: 0 as *mut T,
+            physical_address: 0 as *mut T,
+            number_of_elements: 0,
+            size: 0,
+        }
+    }
+
     pub(crate) fn allocate<A: Allocator>(
         number_of_elements: usize,
         page_size: usize,
         allocator: &A,
     ) -> Result<Dma<T>, Error> {
         let size = core::mem::size_of::<T>() * number_of_elements;
-        let layout = core::alloc::Layout::from_size_align(size, page_size)
-            .map_err(Error::Layout)?;
-        let virtual_address = allocator
-            .allocate::<T>(layout)
-            .map_err(Error::Allocate)?;
+        let layout =
+            core::alloc::Layout::from_size_align(size, page_size).map_err(Error::Layout)?;
+        let virtual_address = allocator.allocate::<T>(layout).map_err(Error::Allocate)?;
         let physical_address = allocator
             .translate_virtual_to_physical(virtual_address as *mut T)
             .map_err(Error::TranslateVirtualToPhysical)?;
@@ -63,9 +70,7 @@ impl<T> Dma<T> {
     pub(crate) fn deallocate<A: Allocator>(self, allocator: &A) -> Result<(), Error> {
         let slice =
             core::ptr::slice_from_raw_parts_mut(self.virtual_address, self.number_of_elements);
-        allocator
-            .deallocate(slice)
-            .map_err(Error::Deallocate)
+        allocator.deallocate(slice).map_err(Error::Deallocate)
     }
 }
 
