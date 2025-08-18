@@ -16,6 +16,7 @@ pub trait Allocator {
 }
 
 #[derive(Debug)]
+#[repr(C)]
 pub struct Dma<T> {
     virtual_address: *mut T,
     physical_address: *mut T,
