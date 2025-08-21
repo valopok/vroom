@@ -96,7 +96,8 @@ impl<A: Allocator> NvmeDevice<A> {
     ) -> Result<Self, Error> {
         #[cfg(feature = "std")]
         env_logger::init();
-        // TODO: follow Memory-based Controller Initialization (PCIe) from the NVMe specification
+        // TODO: follow the Memory-based Controller Initialization (PCIe) from
+        // the NVMe specification more closely
         debug!("Get capabilities");
         let cap = get_register_64(NvmeRegs64::CAP, address, length)?;
         let maximum_queue_entries_supported = (cap & 0xFFFF) as u32 + 1; // MQES (converted)

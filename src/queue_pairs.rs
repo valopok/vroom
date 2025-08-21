@@ -111,7 +111,6 @@ impl<A: Allocator> IoQueuePair<A> {
         );
 
         let tail = self.submission.submit(entry);
-        // TODO: stats.submissions += 1;
         set_submission_queue_tail_doorbell(
             self.id.0,
             tail as u32,
@@ -161,7 +160,6 @@ impl<A: Allocator> IoQueuePair<A> {
         );
 
         let tail = self.submission.submit(entry);
-        // TODO: stats.submissions += 1;
         set_submission_queue_tail_doorbell(
             self.id.0,
             tail as u32,
@@ -186,20 +184,6 @@ impl<A: Allocator> IoQueuePair<A> {
             return Err(Error::IoCompletionQueueFailure(status));
         }
         Ok(completion_queue_entry.sq_head)
-    }
-
-    // TODO: test
-    pub fn quick_poll(&mut self) -> Result<(), Error> {
-        let (tail, completion_queue_entry, _) = self.completion.complete()?;
-        unsafe {
-            core::ptr::write_volatile(self.completion.doorbell as *mut u32, tail as u32);
-        }
-        self.submission.head = completion_queue_entry.sq_head as usize;
-        let status = completion_queue_entry.status >> 1;
-        if status != 0 {
-            return Err(Error::IoCompletionQueueFailure(status));
-        }
-        Ok(())
     }
 }
 
