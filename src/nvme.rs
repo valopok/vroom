@@ -407,20 +407,17 @@ impl<A: Allocator> NvmeDevice<A> {
         namespace_id: &NamespaceId,
         number_of_queue_entries: u32,
     ) -> Result<IoQueuePair<A>, Error> {
-        debug!("1");
         if number_of_queue_entries < 2 {
             return Err(Error::NumberOfQueueEntriesLessThanTwo(
                 number_of_queue_entries,
             ));
         }
-        debug!("2");
         if number_of_queue_entries > self.information.maximum_queue_entries_supported {
             return Err(Error::NumberOfQueueEntriesMoreThanMaximum(
                 number_of_queue_entries,
                 self.information.maximum_queue_entries_supported,
             ));
         }
-        debug!("3");
         let namespace = *self.namespace(namespace_id)?;
 
         // Simple way to avoid collisions while reusing some previously deleted keys.
@@ -431,7 +428,6 @@ impl<A: Allocator> NvmeDevice<A> {
                 break;
             }
         }
-        debug!("4");
         let queue_id = index_option.ok_or(Error::MaximumNumberOfQueuesReached)?;
 
         debug!("Requesting I/O queue pair with ID {}", queue_id.0);
@@ -442,7 +438,6 @@ impl<A: Allocator> NvmeDevice<A> {
             "SQ doorbell offset out of bounds"
         );
 
-        debug!("5");
         let dbl = self.address as usize + offset;
         let completion_queue = CompletionQueue::new(
             number_of_queue_entries as usize,
@@ -450,7 +445,6 @@ impl<A: Allocator> NvmeDevice<A> {
             dbl,
             self.allocator.as_ref(),
         )?;
-        debug!("6");
         self.submit_and_complete_admin(|c_id, _| {
             NvmeCommand::create_io_completion_queue(
                 c_id,
@@ -460,7 +454,6 @@ impl<A: Allocator> NvmeDevice<A> {
             )
         })?;
 
-        debug!("7");
         let dbl = self.address as usize
             + 0x1000
             + ((4 << self.doorbell_stride) * (2 * queue_id.0) as usize);
@@ -470,7 +463,6 @@ impl<A: Allocator> NvmeDevice<A> {
             dbl,
             self.allocator.as_ref(),
         )?;
-        debug!("8");
         self.submit_and_complete_admin(|c_id, _| {
             NvmeCommand::create_io_submission_queue(
                 c_id,
