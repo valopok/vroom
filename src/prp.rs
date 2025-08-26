@@ -14,24 +14,24 @@ use alloc::vec::Vec;
 /// the PRP lists are stored in the `Multiple` variant.
 #[derive(Debug)]
 pub(crate) enum PrpContainer {
-    One(*mut u64),                     // Address of PRP1
-    Two(*mut u64, *mut u64),           // Address of PRP1 and PRP2
-    Multiple(*mut u64, Vec<Dma<u64>>), // Address of PRP1 and PRP list
+    One(usize),                     // Address of PRP1
+    Two(usize, usize),           // Address of PRP1 and PRP2
+    Multiple(usize, Vec<Dma<u64>>), // Address of PRP1 and PRP list
 }
 
 impl PrpContainer {
     pub(crate) fn prp_1(&self) -> *mut u64 {
         match self {
-            PrpContainer::One(prp_1) => *prp_1,
-            PrpContainer::Two(prp_1, _) => *prp_1,
-            PrpContainer::Multiple(prp_1, _) => *prp_1,
+            PrpContainer::One(prp_1) => *prp_1 as *mut u64,
+            PrpContainer::Two(prp_1, _) => *prp_1 as *mut u64,
+            PrpContainer::Multiple(prp_1, _) => *prp_1 as *mut u64,
         }
     }
 
     pub(crate) fn prp_2(&self) -> Option<*mut u64> {
         match self {
             PrpContainer::One(_) => None,
-            PrpContainer::Two(_, prp_2) => Some(*prp_2),
+            PrpContainer::Two(_, prp_2) => Some(*prp_2 as *mut u64),
             PrpContainer::Multiple(_, prp_lists) => Some(prp_lists[0].physical_address()),
         }
     }
@@ -51,7 +51,7 @@ pub(crate) fn allocate<A: Allocator, T>(
     let needed_number_of_pages =
         ((buffer.virtual_address() as usize & (page_size - 1)) + buffer.size()).div_ceil(page_size);
     if needed_number_of_pages == 1 {
-        return Ok(PrpContainer::One(prp_1));
+        return Ok(PrpContainer::One(prp_1 as usize));
     }
     if (buffer.virtual_address() as usize & (page_size - 1)) != 0 {
         return Err(Error::VirtualAddressIsNotPageAligned(
@@ -63,7 +63,7 @@ pub(crate) fn allocate<A: Allocator, T>(
         .translate_virtual_to_physical(unsafe { buffer.virtual_address().add(page_size) })
         .map_err(Error::TranslateVirtualToPhysical)? as *mut u64;
     if needed_number_of_pages == 2 {
-        return Ok(PrpContainer::Two(prp_1, prp_2));
+        return Ok(PrpContainer::Two(prp_1 as usize, prp_2 as usize));
     }
 
     let prp_entries_per_page = page_size / core::mem::size_of::<u64>();
@@ -89,7 +89,7 @@ pub(crate) fn allocate<A: Allocator, T>(
         }
     }
 
-    Ok(PrpContainer::Multiple(prp_1, prp_lists))
+    Ok(PrpContainer::Multiple(prp_1 as usize, prp_lists))
 }
 
 pub(crate) fn deallocate<A: Allocator>(
