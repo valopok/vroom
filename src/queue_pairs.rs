@@ -105,23 +105,6 @@ impl<A: Allocator> IoQueuePair<A> {
         Ok(())
     }
 
-    /// Returns `None` if no command was completed.
-    /// Returns `Some(())` if a command was completed.
-    pub fn quick_poll(&mut self) -> Result<Option<()>, Error> {
-        if let Ok((tail, completion_queue_entry, _)) = self.completion.complete() {
-            unsafe {
-                core::ptr::write_volatile(self.completion.doorbell as *mut u32, tail as u32);
-            }
-            self.submission.head = completion_queue_entry.sq_head as usize;
-            let status = completion_queue_entry.status >> 1;
-            if status != 0 {
-                return Err(Error::IoCompletionQueueFailure(status));
-            }
-            return Ok(Some(()));
-        }
-        Ok(None)
-    }
-
     pub fn submit_read<T>(
         &mut self,
         buffer: &mut Dma<T>,
