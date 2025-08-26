@@ -4,7 +4,10 @@ use crate::error::Error;
 use crate::nvme::Namespace;
 use crate::prp;
 use crate::queues::*;
+use ahash::RandomState;
 use alloc::sync::Arc;
+use core::num::NonZeroUsize;
+use hashbrown::HashMap;
 use log::debug;
 
 #[derive(Debug)]
@@ -52,6 +55,7 @@ pub struct IoQueuePair<A: Allocator> {
     pub(crate) namespace: Namespace,
     pub(crate) device_address: usize,
     pub(crate) doorbell_stride: u16,
+    pub(crate) prp_containers: HashMap<u16, prp::PrpContainer, RandomState>,
 }
 
 impl<A: Allocator> IoQueuePair<A> {
@@ -82,44 +86,9 @@ impl<A: Allocator> IoQueuePair<A> {
     /// The `buffer` needs to be page aligned,
     /// its size must be a multiple of the name space block size and not exceed the maximum transfer size.
     pub fn write<T>(&mut self, buffer: &Dma<T>, logical_block_address: u64) -> Result<(), Error> {
-        if buffer.size() > self.maximum_transfer_size {
-            return Err(Error::BufferLengthBiggerThanMaximumTransferSize(
-                buffer.size(),
-                self.maximum_transfer_size,
-            ));
-        }
-        if buffer.size() as u64 % self.namespace.block_size != 0 {
-            return Err(Error::BufferLengthNotAMultipleOfNamespaceBlockSize(
-                buffer.size(),
-                self.namespace.block_size,
-            ));
-        }
-
-        let prp_container = prp::allocate(buffer, self.page_size, self.allocator.as_ref())?;
-
-        let prp_1 = prp_container.prp_1() as u64;
-        let prp_2 = prp_container.prp_2().map(|prp_2| prp_2 as u64).unwrap_or(0);
-        let blocks = buffer.size() as u64 / self.namespace.block_size;
-
-        let entry = NvmeCommand::io_write(
-            self.submission.tail as u16,
-            self.namespace.id.0,
-            logical_block_address,
-            blocks as u16 - 1,
-            prp_1,
-            prp_2,
-        );
-
-        let tail = self.submission.submit(entry);
-        set_submission_queue_tail_doorbell(
-            self.id.0,
-            tail as u32,
-            self.device_address as *mut u8,
-            self.doorbell_stride,
-        );
-        self.submission.head = self.complete_io(1)? as usize;
-
-        prp::deallocate(prp_container, self.allocator.as_ref())?;
+        self.submit_write(buffer, logical_block_address)?;
+        self.submission.head =
+            self.complete_io(unsafe { NonZeroUsize::new_unchecked(1) })? as usize;
         Ok(())
     }
 
@@ -127,6 +96,34 @@ impl<A: Allocator> IoQueuePair<A> {
     /// The `buffer` needs to be page aligned,
     /// its size must be a multiple of the name space block size and not exceed the maximum transfer size.
     pub fn read<T>(
+        &mut self,
+        buffer: &mut Dma<T>,
+        logical_block_address: u64,
+    ) -> Result<(), Error> {
+        self.submit_read(buffer, logical_block_address)?;
+        self.submission.head =
+            self.complete_io(unsafe { NonZeroUsize::new_unchecked(1) })? as usize;
+        Ok(())
+    }
+
+    /// Returns `None` if no command was completed.
+    /// Returns `Some(())` if a command was completed.
+    pub fn quick_poll(&mut self) -> Result<Option<()>, Error> {
+        if let Ok((tail, completion_queue_entry, _)) = self.completion.complete() {
+            unsafe {
+                std::ptr::write_volatile(self.completion.doorbell as *mut u32, tail as u32);
+            }
+            self.submission.head = completion_queue_entry.sq_head as usize;
+            let status = completion_queue_entry.status >> 1;
+            if status != 0 {
+                return Err(Error::IoCompletionQueueFailure(status));
+            }
+            return Ok(Some(()));
+        }
+        Ok(None)
+    }
+
+    pub fn submit_read<T>(
         &mut self,
         buffer: &mut Dma<T>,
         logical_block_address: u64,
@@ -143,15 +140,18 @@ impl<A: Allocator> IoQueuePair<A> {
                 self.namespace.block_size,
             ));
         }
-
         let prp_container = prp::allocate(buffer, self.page_size, self.allocator.as_ref())?;
-
         let prp_1 = prp_container.prp_1() as u64;
         let prp_2 = prp_container.prp_2().map(|prp_2| prp_2 as u64).unwrap_or(0);
         let blocks = buffer.size() as u64 / self.namespace.block_size;
 
-        let entry = NvmeCommand::io_read(
-            self.submission.tail as u16,
+        let command_id = self.submission.tail as u16;
+        self.prp_containers
+            .try_insert(command_id, prp_container)
+            .map_err(|_| Error::PrpContainerAlreadyExists(command_id))?;
+
+        let command = NvmeCommand::io_read(
+            command_id,
             self.namespace.id.0,
             logical_block_address,
             blocks as u16 - 1,
@@ -159,21 +159,63 @@ impl<A: Allocator> IoQueuePair<A> {
             prp_2,
         );
 
-        let tail = self.submission.submit(entry);
+        let tail = self.submission.submit(command);
         set_submission_queue_tail_doorbell(
             self.id.0,
             tail as u32,
             self.device_address as *mut u8,
             self.doorbell_stride,
         );
-        self.submission.head = self.complete_io(1)? as usize;
-
-        prp::deallocate(prp_container, self.allocator.as_ref())?;
         Ok(())
     }
 
-    fn complete_io(&mut self, n: usize) -> Result<u16, Error> {
-        assert!(n > 0);
+    pub fn submit_write<T>(
+        &mut self,
+        buffer: &Dma<T>,
+        logical_block_address: u64,
+    ) -> Result<(), Error> {
+        if buffer.size() > self.maximum_transfer_size {
+            return Err(Error::BufferLengthBiggerThanMaximumTransferSize(
+                buffer.size(),
+                self.maximum_transfer_size,
+            ));
+        }
+        if buffer.size() as u64 % self.namespace.block_size != 0 {
+            return Err(Error::BufferLengthNotAMultipleOfNamespaceBlockSize(
+                buffer.size(),
+                self.namespace.block_size,
+            ));
+        }
+        let prp_container = prp::allocate(buffer, self.page_size, self.allocator.as_ref())?;
+        let prp_1 = prp_container.prp_1() as u64;
+        let prp_2 = prp_container.prp_2().map(|prp_2| prp_2 as u64).unwrap_or(0);
+        let blocks = buffer.size() as u64 / self.namespace.block_size;
+
+        let command_id = self.submission.tail as u16;
+        self.prp_containers
+            .try_insert(command_id, prp_container)
+            .map_err(|_| Error::PrpContainerAlreadyExists(command_id))?;
+
+        let command = NvmeCommand::io_write(
+            command_id,
+            self.namespace.id.0,
+            logical_block_address,
+            blocks as u16 - 1,
+            prp_1,
+            prp_2,
+        );
+
+        let tail = self.submission.submit(command);
+        set_submission_queue_tail_doorbell(
+            self.id.0,
+            tail as u32,
+            self.device_address as *mut u8,
+            self.doorbell_stride,
+        );
+        Ok(())
+    }
+
+    pub fn complete_io(&mut self, n: NonZeroUsize) -> Result<u16, Error> {
         let (tail, completion_queue_entry, _) = self.completion.complete_n(n);
         unsafe {
             core::ptr::write_volatile(self.completion.doorbell as *mut u32, tail as u32);
@@ -182,6 +224,11 @@ impl<A: Allocator> IoQueuePair<A> {
         let status = completion_queue_entry.status >> 1;
         if status != 0 {
             return Err(Error::IoCompletionQueueFailure(status));
+        }
+        let command_id = completion_queue_entry.command_id;
+        let prp_container = self.prp_containers.remove(&command_id);
+        if let Some(prp_container) = prp_container {
+            prp::deallocate(prp_container, self.allocator.as_ref())?;
         }
         Ok(completion_queue_entry.sq_head)
     }

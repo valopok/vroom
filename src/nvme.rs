@@ -483,6 +483,7 @@ impl<A: Allocator> NvmeDevice<A> {
             namespace,
             device_address: self.address as usize,
             doorbell_stride: self.doorbell_stride,
+            prp_containers: HashMap::with_hasher(RandomState::with_seeds(0, 0, 0, 0)),
         };
         self.io_queue_pair_ids.push(queue_id);
         Ok(io_queue_pair)

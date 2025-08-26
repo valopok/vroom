@@ -35,6 +35,7 @@ pub enum Error {
     IoCompletionQueueFailure(u16),
     SubmissionQueueFull,
     CompletionQueueCompletionFailure,
+    PrpContainerAlreadyExists(u16),
 }
 
 impl fmt::Display for Error {
@@ -115,6 +116,9 @@ impl fmt::Display for Error {
             Error::SubmissionQueueFull => write!(f, "The submission queue is full."),
             Error::CompletionQueueCompletionFailure => write!(f,
                 "The completion queue could not complete the command."
+            ),
+            Error::PrpContainerAlreadyExists(command_id) => write!(f,
+                "PRP container already exists for the command ID {command_id}."
             ),
         }
     }

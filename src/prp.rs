@@ -12,6 +12,7 @@ use alloc::vec::Vec;
 /// If two entries suffice, the physical addressess in those entries are stored in the `Two` variant.
 /// If more than two entries are needed, the physical address in the first entry and the pointer to
 /// the PRP lists are stored in the `Multiple` variant.
+#[derive(Debug)]
 pub(crate) enum PrpContainer {
     One(*mut u64),                     // Address of PRP1
     Two(*mut u64, *mut u64),           // Address of PRP1 and PRP2
