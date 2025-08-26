@@ -6,7 +6,6 @@ use crate::prp;
 use crate::queues::*;
 use ahash::RandomState;
 use alloc::sync::Arc;
-use core::num::NonZeroUsize;
 use hashbrown::HashMap;
 use log::debug;
 
@@ -88,7 +87,7 @@ impl<A: Allocator> IoQueuePair<A> {
     pub fn write<T>(&mut self, buffer: &Dma<T>, logical_block_address: u64) -> Result<(), Error> {
         self.submit_write(buffer, logical_block_address)?;
         self.submission.head =
-            self.complete_io(unsafe { NonZeroUsize::new_unchecked(1) })? as usize;
+            self.complete_io()? as usize;
         Ok(())
     }
 
@@ -102,7 +101,7 @@ impl<A: Allocator> IoQueuePair<A> {
     ) -> Result<(), Error> {
         self.submit_read(buffer, logical_block_address)?;
         self.submission.head =
-            self.complete_io(unsafe { NonZeroUsize::new_unchecked(1) })? as usize;
+            self.complete_io()? as usize;
         Ok(())
     }
 
@@ -215,8 +214,8 @@ impl<A: Allocator> IoQueuePair<A> {
         Ok(())
     }
 
-    pub fn complete_io(&mut self, n: NonZeroUsize) -> Result<u16, Error> {
-        let (tail, completion_queue_entry, _) = self.completion.complete_n(n);
+    pub fn complete_io(&mut self) -> Result<u16, Error> {
+        let (tail, completion_queue_entry, _) = self.completion.complete()?;
         unsafe {
             core::ptr::write_volatile(self.completion.doorbell as *mut u32, tail as u32);
         }

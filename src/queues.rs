@@ -2,7 +2,6 @@ use crate::cmd::NvmeCommand;
 use crate::dma::{Allocator, Dma};
 use crate::error::Error;
 use core::hint::spin_loop;
-use core::num::NonZeroUsize;
 
 #[derive(Debug)]
 pub(crate) struct SubmissionQueue {
@@ -118,19 +117,6 @@ impl CompletionQueue {
         } else {
             Err(Error::CompletionQueueCompletionFailure)
         }
-    }
-
-    #[inline(always)]
-    pub(crate) fn complete_n(&mut self, commands: NonZeroUsize) -> (usize, CompletionQueueEntry, usize) {
-        let prev = self.head;
-        self.head += commands.get() - 1;
-        if self.head >= self.len {
-            self.phase = !self.phase;
-        }
-        self.head %= self.len;
-
-        let (head, entry, _) = self.complete_spin();
-        (head, entry, prev)
     }
 
     #[inline(always)]
