@@ -86,8 +86,7 @@ impl<A: Allocator> IoQueuePair<A> {
     /// its size must be a multiple of the name space block size and not exceed the maximum transfer size.
     pub fn write<T>(&mut self, buffer: &Dma<T>, logical_block_address: u64) -> Result<(), Error> {
         self.submit_write(buffer, logical_block_address)?;
-        self.submission.head =
-            self.complete_io()? as usize;
+        self.complete_io()?;
         Ok(())
     }
 
@@ -100,8 +99,7 @@ impl<A: Allocator> IoQueuePair<A> {
         logical_block_address: u64,
     ) -> Result<(), Error> {
         self.submit_read(buffer, logical_block_address)?;
-        self.submission.head =
-            self.complete_io()? as usize;
+        self.complete_io()?;
         Ok(())
     }
 
@@ -197,7 +195,7 @@ impl<A: Allocator> IoQueuePair<A> {
         Ok(())
     }
 
-    pub fn complete_io(&mut self) -> Result<u16, Error> {
+    pub fn complete_io(&mut self) -> Result<(), Error> {
         let (tail, completion_queue_entry, _) = self.completion.complete()?;
         unsafe {
             core::ptr::write_volatile(self.completion.doorbell as *mut u32, tail as u32);
@@ -212,7 +210,7 @@ impl<A: Allocator> IoQueuePair<A> {
         if let Some(prp_container) = prp_container {
             prp::deallocate(prp_container, self.allocator.as_ref())?;
         }
-        Ok(completion_queue_entry.sq_head)
+        Ok(())
     }
 }
 
