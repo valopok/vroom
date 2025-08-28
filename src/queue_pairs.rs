@@ -86,7 +86,11 @@ impl<A: Allocator> IoQueuePair<A> {
     /// its size must be a multiple of the name space block size and not exceed the maximum transfer size.
     pub fn write<T>(&mut self, buffer: &Dma<T>, logical_block_address: u64) -> Result<(), Error> {
         self.submit_write(buffer, logical_block_address)?;
-        self.complete_io()?;
+        loop {
+            if let Ok(()) = self.complete_io() {
+                break;
+            }
+        }
         Ok(())
     }
 
@@ -99,7 +103,11 @@ impl<A: Allocator> IoQueuePair<A> {
         logical_block_address: u64,
     ) -> Result<(), Error> {
         self.submit_read(buffer, logical_block_address)?;
-        self.complete_io()?;
+        loop {
+            if let Ok(()) = self.complete_io() {
+                break;
+            }
+        }
         Ok(())
     }
 
