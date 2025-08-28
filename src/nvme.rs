@@ -506,24 +506,15 @@ impl<A: Allocator> NvmeDevice<A> {
         Ok(())
     }
 
-    // TODO: test
-    pub fn clear_namespace(
-        &mut self,
-        namespace_id_option: Option<NamespaceId>,
-    ) -> Result<(), Error> {
-        let namespace_id = if let Some(namespace_id) = namespace_id_option {
-            assert!(self.namespaces.contains_key(&namespace_id));
-            namespace_id
-        } else {
-            NamespaceId(0xFFFF_FFFF)
-        };
-        self.admin_queue_pair.submit_and_complete(
-            |command_id, _| NvmeCommand::format_nvm(command_id, namespace_id.0),
-            &self.buffer,
-            self.address,
-            self.doorbell_stride,
-        )?;
-        Ok(())
+    pub fn clear_namespace(&mut self, namespace_id: &NamespaceId) -> Result<(), Error> {
+        self.admin_queue_pair
+            .submit_and_complete(
+                |command_id, _| NvmeCommand::format_nvm(command_id, namespace_id.0),
+                &self.buffer,
+                self.address,
+                self.doorbell_stride,
+            )
+            .map(|_| ())
     }
 
     /// This initiates a normal Memory-based Controller Shutdown (PCIe).
