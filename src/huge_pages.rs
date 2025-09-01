@@ -7,7 +7,7 @@ use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{fs, mem, process, ptr};
 
-const HUGE_PAGE_BITS: u32 = 16;
+const HUGE_PAGE_BITS: u32 = 21;
 pub const HUGE_PAGE_SIZE: usize = 1 << HUGE_PAGE_BITS;
 
 static HUGE_PAGE_ID: AtomicUsize = AtomicUsize::new(0);

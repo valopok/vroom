@@ -4,7 +4,7 @@ mod cmd;
 mod dma;
 mod error;
 #[cfg(feature = "std")]
-mod huge_tables;
+mod huge_pages;
 mod nvme;
 #[cfg(feature = "std")]
 mod pci;
@@ -19,7 +19,7 @@ extern crate std;
 pub use dma::{Allocator, Dma};
 pub use error::Error;
 #[cfg(feature = "std")]
-pub use huge_tables::{HugePageAllocator, HUGE_PAGE_SIZE};
+pub use huge_pages::{HugePageAllocator, HUGE_PAGE_SIZE};
 pub use nvme::{ControllerInformation, Namespace, NamespaceId, NvmeDevice};
 pub use queue_pairs::{IoQueuePair, IoQueuePairId};
 
