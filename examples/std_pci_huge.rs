@@ -4,16 +4,15 @@ use vroom::Error;
 pub fn main() -> Result<(), Error> {
     let mut args = env::args();
     args.next();
-
-    let pci_addr = match args.next() {
+    let pci_address = match args.next() {
         Some(arg) => arg,
         None => {
-            eprintln!("Usage: cargo run --example std_pci_huge <pci bus id>");
+            eprintln!("Usage: cargo run --example std_pci_huge <PCI bus ID>");
             process::exit(1);
         }
     };
 
-    let mut nvme = vroom::new_pci_and_huge(&pci_addr)?;
+    let mut nvme = vroom::new_pci_and_huge(&pci_address)?;
 
     let namespace_ids = nvme.namespace_ids();
     let namespace_id = namespace_ids
