@@ -1,25 +1,28 @@
-use std::error::Error;
+use core::error::Error;
+use core::ptr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::prelude::AsRawFd;
-use std::ptr;
+use std::format;
+use std::string::String;
+use std::boxed::Box;
 
 use byteorder::{NativeEndian, ReadBytesExt, WriteBytesExt};
 
 // write to the command register (offset 4) in the PCIe config space
-pub const COMMAND_REGISTER_OFFSET: u64 = 4;
+pub(crate) const COMMAND_REGISTER_OFFSET: u64 = 4;
 // bit 2: "bus master enable", see PCIe 3.0 specification section 7.5.1.1
-pub const BUS_MASTER_ENABLE_BIT: u64 = 2;
+pub(crate) const BUS_MASTER_ENABLE_BIT: u64 = 2;
 // bit 10: "interrupt disable"
-pub const INTERRUPT_DISABLE: u64 = 10;
+pub(crate) const INTERRUPT_DISABLE: u64 = 10;
 
-/// Unbinds the driver from the device at `pci_addr`.
-pub fn unbind_driver(pci_addr: &str) -> Result<(), Box<dyn Error>> {
-    let path = format!("/sys/bus/pci/devices/{}/driver/unbind", pci_addr);
+/// Unbinds the driver from the device at `pci_address`.
+pub(crate) fn unbind_driver(pci_address: &str) -> Result<(), Box<dyn Error>> {
+    let path = format!("/sys/bus/pci/devices/{pci_address}/driver/unbind");
 
     match fs::OpenOptions::new().write(true).open(path) {
         Ok(mut f) => {
-            write!(f, "{}", pci_addr)?;
+            write!(f, "{pci_address}")?;
             Ok(())
         }
         Err(ref e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -27,9 +30,9 @@ pub fn unbind_driver(pci_addr: &str) -> Result<(), Box<dyn Error>> {
     }
 }
 
-/// Enables direct memory access for the device at `pci_addr`.
-pub fn enable_dma(pci_addr: &str) -> Result<(), Box<dyn Error>> {
-    let path = format!("/sys/bus/pci/devices/{}/config", pci_addr);
+/// Enables direct memory access for the device at `pci_address`.
+pub(crate) fn enable_dma(pci_address: &str) -> Result<(), Box<dyn Error>> {
+    let path = format!("/sys/bus/pci/devices/{pci_address}/config");
     let mut file = fs::OpenOptions::new().read(true).write(true).open(path)?;
 
     let mut dma = read_io16(&mut file, COMMAND_REGISTER_OFFSET)?;
@@ -39,9 +42,9 @@ pub fn enable_dma(pci_addr: &str) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// Disable INTx interrupts for the device at `pci_addr`.
-pub fn disable_interrupts(pci_addr: &str) -> Result<(), Box<dyn Error>> {
-    let path = format!("/sys/bus/pci/devices/{}/config", pci_addr);
+/// Disable INTx interrupts for the device at `pci_address`.
+pub(crate) fn disable_interrupts(pci_address: &str) -> Result<(), Box<dyn Error>> {
+    let path = format!("/sys/bus/pci/devices/{pci_address}/config");
     let mut file = fs::OpenOptions::new().read(true).write(true).open(path)?;
 
     let mut dma = read_io16(&mut file, COMMAND_REGISTER_OFFSET)?;
@@ -52,12 +55,12 @@ pub fn disable_interrupts(pci_addr: &str) -> Result<(), Box<dyn Error>> {
 }
 
 /// Mmaps a pci resource and returns a pointer to the mapped memory.
-pub fn pci_map_resource(pci_addr: &str) -> Result<(*mut u8, usize), Box<dyn Error>> {
-    let path = format!("/sys/bus/pci/devices/{}/resource0", pci_addr);
+pub(crate) fn mmap_resource(pci_address: &str) -> Result<(*mut u8, usize), Box<dyn Error>> {
+    let path = format!("/sys/bus/pci/devices/{pci_address}/resource0");
 
-    unbind_driver(pci_addr)?;
-    enable_dma(pci_addr)?;
-    disable_interrupts(pci_addr)?;
+    unbind_driver(pci_address)?;
+    enable_dma(pci_address)?;
+    disable_interrupts(pci_address)?;
 
     let file = fs::OpenOptions::new().read(true).write(true).open(&path)?;
     let len = fs::metadata(&path)?.len() as usize;
@@ -80,68 +83,74 @@ pub fn pci_map_resource(pci_addr: &str) -> Result<(*mut u8, usize), Box<dyn Erro
     }
 }
 
+#[allow(dead_code)]
 /// Opens a pci resource file at the given address.
-pub fn pci_open_resource(pci_addr: &str, resource: &str) -> Result<File, Box<dyn Error>> {
-    let path = format!("/sys/bus/pci/devices/{}/{}", pci_addr, resource);
+pub(crate) fn open_resource(pci_address: &str, resource: &str) -> Result<File, Box<dyn Error>> {
+    let path = format!("/sys/bus/pci/devices/{pci_address}/{resource}");
     Ok(OpenOptions::new().read(true).write(true).open(path)?)
 }
 
 /// Opens a pci resource file at the given address in read-only mode.
-pub fn pci_open_resource_ro(pci_addr: &str, resource: &str) -> Result<File, Box<dyn Error>> {
-    let path = format!("/sys/bus/pci/devices/{}/{}", pci_addr, resource);
+pub(crate) fn open_resource_readonly(pci_address: &str, resource: &str) -> Result<File, Box<dyn Error>> {
+    let path = format!("/sys/bus/pci/devices/{pci_address}/{resource}");
     Ok(OpenOptions::new().read(true).write(false).open(path)?)
 }
 
+#[allow(dead_code)]
 /// Reads and returns an u8 at `offset` in `file`.
-pub fn read_io8(file: &mut File, offset: u64) -> Result<u8, io::Error> {
+pub(crate) fn read_io8(file: &mut File, offset: u64) -> Result<u8, io::Error> {
     file.seek(SeekFrom::Start(offset))?;
     file.read_u8()
 }
 
 /// Reads and returns an u16 at `offset` in `file`.
-pub fn read_io16(file: &mut File, offset: u64) -> Result<u16, io::Error> {
+pub(crate) fn read_io16(file: &mut File, offset: u64) -> Result<u16, io::Error> {
     file.seek(SeekFrom::Start(offset))?;
     file.read_u16::<NativeEndian>()
 }
 
 /// Reads and returns an u32 at `offset` in `file`.
-pub fn read_io32(file: &mut File, offset: u64) -> Result<u32, io::Error> {
+pub(crate) fn read_io32(file: &mut File, offset: u64) -> Result<u32, io::Error> {
     file.seek(SeekFrom::Start(offset))?;
     file.read_u32::<NativeEndian>()
 }
 
+#[allow(dead_code)]
 /// Writes an u64 at `offset` in `file`.
-pub fn read_io64(file: &mut File, offset: u64) -> Result<u64, io::Error> {
+pub(crate) fn read_io64(file: &mut File, offset: u64) -> Result<u64, io::Error> {
     file.seek(SeekFrom::Start(offset))?;
     file.read_u64::<NativeEndian>()
 }
 
+#[allow(dead_code)]
 /// Writes an u8 at `offset` in `file`.
-pub fn write_io8(file: &mut File, value: u8, offset: u64) -> Result<(), io::Error> {
+pub(crate) fn write_io8(file: &mut File, value: u8, offset: u64) -> Result<(), io::Error> {
     file.seek(SeekFrom::Start(offset))?;
     file.write_u8(value)
 }
 
 /// Writes an u16 at `offset` in `file`.
-pub fn write_io16(file: &mut File, value: u16, offset: u64) -> Result<(), io::Error> {
+pub(crate) fn write_io16(file: &mut File, value: u16, offset: u64) -> Result<(), io::Error> {
     file.seek(SeekFrom::Start(offset))?;
     file.write_u16::<NativeEndian>(value)
 }
 
+#[allow(dead_code)]
 /// Writes an u32 at `offset` in `file`.
-pub fn write_io32(file: &mut File, value: u32, offset: u64) -> Result<(), io::Error> {
+pub(crate) fn write_io32(file: &mut File, value: u32, offset: u64) -> Result<(), io::Error> {
     file.seek(SeekFrom::Start(offset))?;
     file.write_u32::<NativeEndian>(value)
 }
 
+#[allow(dead_code)]
 /// Writes an u64 at `offset` in `file`.
-pub fn write_io64(file: &mut File, value: u64, offset: u64) -> Result<(), io::Error> {
+pub(crate) fn write_io64(file: &mut File, value: u64, offset: u64) -> Result<(), io::Error> {
     file.seek(SeekFrom::Start(offset))?;
     file.write_u64::<NativeEndian>(value)
 }
 
 /// Reads a hex string from `file` and returns it as `u64`.
-pub fn read_hex(file: &mut File) -> Result<u64, Box<dyn Error>> {
+pub(crate) fn read_hex(file: &mut File) -> Result<u64, Box<dyn Error>> {
     let mut buffer = String::new();
     file.read_to_string(&mut buffer)?;
 

@@ -1,16 +1,624 @@
-use crate::cmd::NvmeCommand;
-use crate::memory::{Dma, DmaSlice};
-use crate::pci::pci_map_resource;
+use crate::cmd::{FeatureIdentifier, IdentifyNamespace, NvmeCommand, Select};
+use crate::dma::{Allocator, Dma};
+use crate::error::Error;
+#[cfg(feature = "std")]
+use crate::pci;
+use crate::queue_pairs::{AdminQueuePair, IoQueuePair, IoQueuePairId};
 use crate::queues::*;
-use crate::{NvmeNamespace, NvmeStats, HUGE_PAGE_SIZE};
-use std::collections::HashMap;
-use std::error::Error;
-use std::hint::spin_loop;
+use ahash::RandomState;
+use alloc::string::{String, ToString};
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+use core::hint::spin_loop;
+use hashbrown::HashMap;
+use log::debug;
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct NamespaceId(pub u32);
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct Namespace {
+    pub id: NamespaceId,
+    pub blocks: u64,
+    pub block_size: u64,
+}
+
+#[derive(Debug)]
+pub struct ControllerInformation {
+    pub pci_vendor_id: u16,
+    pub pci_subsystem_vendor_id: u16,
+    pub serial_number: String,
+    pub model_number: String,
+    pub firmware_revision: String,
+    pub minimum_memory_page_size: u64,
+    pub maximum_memory_page_size: u64,
+    pub memory_page_size: usize,
+    pub maximum_number_of_io_queue_pairs: u16,
+    pub maximum_queue_entries_supported: u32,
+    pub maximum_transfer_size: usize,
+    pub controller_id: u16,
+    pub version: u32,
+}
+
+#[derive(Debug)]
+pub struct NvmeDevice<A> {
+    allocator: Arc<A>,
+    address: *mut u8, // BAR address
+    length: usize,    // BAR length
+    doorbell_stride: u16,
+    admin_queue_pair: AdminQueuePair,
+    io_queue_pair_ids: Vec<IoQueuePairId>,
+    information: ControllerInformation,
+    namespaces: HashMap<NamespaceId, Namespace, RandomState>,
+    buffer: Dma<u8>,
+}
+
+unsafe impl<A> Send for NvmeDevice<A> {}
+unsafe impl<A> Sync for NvmeDevice<A> {}
+
+impl<A: Allocator> NvmeDevice<A> {
+    #[cfg(feature = "std")]
+    pub fn from_pci_address(
+        pci_address: &str,
+        page_size: usize,
+        allocator: A,
+    ) -> Result<Self, Error> {
+        let mut vendor_file =
+            pci::open_resource_readonly(pci_address, "vendor").expect("wrong pci address");
+        let mut device_file =
+            pci::open_resource_readonly(pci_address, "device").expect("wrong pci address");
+        let mut config_file =
+            pci::open_resource_readonly(pci_address, "config").expect("wrong pci address");
+
+        let _vendor_id = pci::read_hex(&mut vendor_file).map_err(Error::UnixPciError)?;
+        let _device_id = pci::read_hex(&mut device_file).map_err(Error::UnixPciError)?;
+        let class_id = pci::read_io32(&mut config_file, 8)
+            .map_err(|error| Error::UnixPciError(error.into()))?
+            >> 16;
+
+        // 0x01 -> mass storage device class id
+        // 0x08 -> nvme subclass
+        if class_id != 0x0108 {
+            return Err(Error::NotABlockDevice(pci_address.to_string()));
+        }
+
+        let (address, length) = pci::mmap_resource(pci_address).map_err(Error::UnixPciError)?;
+        NvmeDevice::new(address, length, page_size, allocator)
+    }
+
+    pub fn new(
+        address: *mut u8,
+        length: usize,
+        page_size: usize,
+        allocator: A,
+    ) -> Result<Self, Error> {
+        #[cfg(feature = "std")]
+        env_logger::init();
+        // TODO: follow the Memory-based Controller Initialization (PCIe) from
+        // the NVMe specification more closely
+        debug!("Get capabilities");
+        let cap = get_register_64(NvmeRegs64::CAP, address, length)?;
+        let maximum_queue_entries_supported = (cap & 0xFFFF) as u32 + 1; // MQES (converted)
+        let _contiguous_queues_required = ((cap >> 16) & 0b1) == 1; // CQR
+        let _weighted_round_robin_with_urgent_priority_class = ((cap >> 17) & 0b1) == 1; // AMS: WRRUPC
+        let _vendor_specific_ams = ((cap >> 18) & 0b1) == 1; // AMS: VS
+        let _timeout_milliseconds = ((cap >> 24) & 0b1111_1111) as u32 * 500; // TO (converted)
+        let doorbell_stride = ((cap >> 32) & 0b1111) as u16; // DSTRD
+        let _nvm_subsystem_reset_supported = ((cap >> 36) & 0b1) == 1; // NSSRS
+        let nvm_command_set_support = ((cap >> 37) & 0b1) == 1; // CSS: NCSS
+        let _io_command_set_support = ((cap >> 43) & 0b1) == 1; // CSS: I/OCSS
+        let _no_io_command_set_support = ((cap >> 44) & 0b1) == 1; // CSS: NOI/OCSS
+        let _boot_partition_support = ((cap >> 45) & 0b1) == 1; // BPS
+        let _controller_power_scope = ((cap >> 46) & 0b11) as u8; // CPS
+        let minimum_memory_page_size = 1u64 << (((cap >> 48) & 0b1111) + 12); // MPSMIN (converted)
+        let maximum_memory_page_size = 1u64 << (((cap >> 52) & 0b1111) + 12); // MPSMAX (converted)
+        let _persistend_memory_region_supported = ((cap >> 56) & 0b1) == 1; // PMRS
+        let _controller_memory_buffer_supported = ((cap >> 57) & 0b1) == 1; // CMBS
+        let _nvm_subsystem_shutdown_supported = ((cap >> 58) & 0b1) == 1; // NSSS
+        let _controller_ready_with_media_support = ((cap >> 59) & 0b1) == 1; // CRMS: CRIMS
+        let _controller_ready_independent_of_media_support = ((cap >> 60) & 0b1) == 1; // CRMS: CRWMS
+        let _nvm_subsystem_shutdown_enhancements_supported = ((cap >> 61) & 0b1) == 1; // NSSES
+
+        if maximum_queue_entries_supported == 1 {
+            return Err(Error::MaximumQueueEntriesSupportedInvalidlyZero);
+        }
+        if !nvm_command_set_support {
+            return Err(Error::NvmCommandSetNotSupported);
+        }
+        if minimum_memory_page_size > maximum_memory_page_size {
+            return Err(Error::MemoryPageSizeMinimumBiggerThanMaximum(
+                maximum_memory_page_size,
+                maximum_memory_page_size,
+            ));
+        }
+
+        let ps_4_kibi_byte = 2usize.pow(12); // the lowest minimum page size
+        let ps_128_mebi_byte = 2usize.pow(28); // the highest maximum page size
+        if page_size < ps_4_kibi_byte {
+            return Err(Error::PageSizeLessThanNvmeMinimum(page_size));
+        }
+        if page_size > ps_128_mebi_byte {
+            return Err(Error::PageSizeMoreThanNvmeMaximum(page_size));
+        }
+        if (page_size as u64) < minimum_memory_page_size {
+            return Err(Error::PageSizeLessThanControllerMinimum(
+                page_size,
+                minimum_memory_page_size,
+            ));
+        }
+        if page_size as u64 > maximum_memory_page_size {
+            return Err(Error::PageSizeMoreThanControllerMaximum(
+                page_size,
+                maximum_memory_page_size,
+            ));
+        }
+        if page_size.count_ones() != 1 {
+            return Err(Error::PageSizeNotAPowerOfTwo(page_size));
+        }
+
+        debug!("Disable controller");
+        let mut cc = get_register_32(NvmeRegs32::CC, address, length)?;
+        cc &= 0xFFFF_FFFE; // Set Enable (EN) to 0 to disable the controller.
+        set_register_32(NvmeRegs32::CC, cc, address, length)?;
+
+        // Wait for "not ready" signal
+        loop {
+            let csts = get_register_32(NvmeRegs32::CSTS, address, length)?;
+            if csts & 1 == 1 {
+                spin_loop();
+            } else {
+                break;
+            }
+        }
+
+        debug!("Configure admin queues");
+        let admin_sq = SubmissionQueue::new(
+            maximum_queue_entries_supported as usize,
+            page_size,
+            0,
+            &allocator,
+        )?;
+        let admin_cq = CompletionQueue::new(
+            maximum_queue_entries_supported as usize,
+            page_size,
+            0,
+            &allocator,
+        )?;
+        set_register_64(NvmeRegs64::ASQ, admin_sq.get_addr() as u64, address, length)?;
+        set_register_64(NvmeRegs64::ACQ, admin_cq.get_addr() as u64, address, length)?;
+        let aqa = (maximum_queue_entries_supported as u32 - 1) << 16
+            | (maximum_queue_entries_supported as u32 - 1);
+        set_register_32(NvmeRegs32::AQA, aqa, address, length)?;
+        let mut admin_queue_pair = AdminQueuePair {
+            submission: admin_sq,
+            completion: admin_cq,
+        };
+
+        debug!("Set controller configuration");
+        let enable = 0b1; // EN
+        let reserved_1 = 0b000 << 1;
+        let io_command_set_selected = 0b000 << 4; // CSS TODO
+        let memory_page_size = ((page_size.ilog2() - 12) & 0b1111) << 7; // MPS
+        let arbitration_mechanism_selected = 0b000 << 11; // AMS TODO
+        let shutdown_notification = 0b00 << 14; // SHN
+        let io_submission_queue_entry_size = 6 << 16; // I/OSQES (2^n) TODO
+        let io_completion_queue_entry_size = 4 << 20; // I/OCQES (2^n) TODO
+        let controller_ready_independent_of_media_enable = 0b0 << 24; // CRIME TODO
+        let reserved_2 = 0b000_0000 << 25;
+        let cc = enable
+            | reserved_1
+            | io_command_set_selected
+            | memory_page_size
+            | arbitration_mechanism_selected
+            | shutdown_notification
+            | io_submission_queue_entry_size
+            | io_completion_queue_entry_size
+            | controller_ready_independent_of_media_enable
+            | reserved_2;
+        set_register_32(NvmeRegs32::CC, cc, address, length)?;
+
+        debug!("Enable controller");
+        // Wait for "ready" signal
+        loop {
+            let csts = get_register_32(NvmeRegs32::CSTS, address, length)?;
+            if csts & 1 == 0 {
+                spin_loop();
+            } else {
+                break;
+            }
+        }
+
+        debug!("Allocate buffer");
+        let buffer = Dma::allocate(page_size, page_size, &allocator)?;
+
+        debug!("Identify controller");
+        admin_queue_pair.submit_and_complete(
+            NvmeCommand::identify_controller,
+            &buffer,
+            address,
+            doorbell_stride,
+        )?;
+        fn read_c_string_from_slice(slice: &[u8]) -> String {
+            let mut string = String::new();
+            for &byte in slice {
+                if byte == 0 {
+                    break;
+                }
+                string.push(byte as char);
+            }
+            string.trim().to_string()
+        }
+        let pci_vendor_id = ((buffer[1] as u16) << 8) | buffer[0] as u16; // VID
+        let pci_subsystem_vendor_id = ((buffer[3] as u16) << 8) | buffer[2] as u16; // SSVID
+        let serial_number = read_c_string_from_slice(&buffer[4..=23]); // SN
+        let model_number = read_c_string_from_slice(&buffer[24..=63]); // MN
+        let firmware_revision = read_c_string_from_slice(&buffer[64..=71]); // FR
+        let maximum_data_transfer_size = 1usize << buffer[77]; // MDTS (converted)
+        let controller_id = ((buffer[79] as u16) << 8) | buffer[78] as u16; // CNTLID
+        let version = ((buffer[83] as u32) << 24)
+            | ((buffer[82] as u32) << 16)
+            | ((buffer[81] as u32) << 8)
+            | buffer[80] as u32; // VER
+        let controller_type = buffer[111]; // CNTRLTYPE
+
+        if controller_type != 1 {
+            let type_name = match controller_type {
+                0 => "not reported",
+                2 => "discovery controller",
+                3 => "administrative controller",
+                _ => "unknown",
+            };
+            return Err(Error::ControllerTypeInvalid(type_name.to_string()));
+        }
+        let maximum_transfer_size = minimum_memory_page_size as usize * maximum_data_transfer_size;
+
+        debug!("Get features");
+        let completion_queue_entry = admin_queue_pair.submit_and_complete(
+            |command_id, address| {
+                NvmeCommand::get_features(
+                    command_id,
+                    address,
+                    FeatureIdentifier::NumberOfQueues,
+                    Select::Current,
+                )
+            },
+            &buffer,
+            address,
+            doorbell_stride,
+        )?;
+        let dword_0 = completion_queue_entry.command_specific;
+        // Not adding 1 to account for the admin queue pair.
+        // These are normally 0's based values.
+        let number_of_io_submission_queues_allocated = dword_0 as u16;
+        let number_of_io_completion_queues_allocated = (dword_0 >> 16) as u16;
+        debug!(
+            "Number of io submission queues allocated: {number_of_io_submission_queues_allocated}"
+        );
+        debug!(
+            "Number of io completion queues allocated: {number_of_io_completion_queues_allocated}"
+        );
+        let maximum_number_of_io_queue_pairs =
+            number_of_io_submission_queues_allocated.min(number_of_io_completion_queues_allocated);
+
+        let information = ControllerInformation {
+            pci_vendor_id,
+            pci_subsystem_vendor_id,
+            serial_number,
+            model_number,
+            firmware_revision,
+            minimum_memory_page_size,
+            maximum_memory_page_size,
+            memory_page_size: page_size,
+            maximum_number_of_io_queue_pairs,
+            maximum_queue_entries_supported,
+            maximum_transfer_size,
+            controller_id,
+            version,
+        };
+        debug!("{information:?}");
+
+        debug!("Identify active namespace IDs");
+        // Identify active namespace IDs
+        admin_queue_pair.submit_and_complete(
+            |c_id, address| NvmeCommand::identify_namespace_list(c_id, address, 0),
+            &buffer,
+            address,
+            doorbell_stride,
+        )?;
+        let buffer_as_u32: &[u32] = unsafe {
+            core::slice::from_raw_parts(
+                buffer.virtual_address() as *const u32,
+                buffer.number_of_elements() / 4,
+            )
+        };
+        let namespace_ids = buffer_as_u32
+            .iter()
+            .copied()
+            .take_while(|&id| id != 0)
+            .map(NamespaceId)
+            .collect::<Vec<NamespaceId>>();
+        debug!("{namespace_ids:?}");
+
+        debug!("Identify individual namespaces");
+        // Identify individual namespaces
+        let mut namespaces = HashMap::with_hasher(RandomState::with_seeds(0, 0, 0, 0));
+        for namespace_id in namespace_ids {
+            admin_queue_pair.submit_and_complete(
+                |c_id, address| NvmeCommand::identify_namespace(c_id, address, namespace_id.0),
+                &buffer,
+                address,
+                doorbell_stride,
+            )?;
+
+            let namespace_data: IdentifyNamespace =
+                unsafe { (*(buffer.virtual_address() as *const IdentifyNamespace)).clone() };
+
+            // figure out block size
+            let flba_index = (namespace_data.formatted_lba_size & 0xF) as usize;
+            let flba_data = (namespace_data.lba_formats_list[flba_index] >> 16) & 0xFF;
+            let block_size = if !(9..32).contains(&flba_data) {
+                0
+            } else {
+                1 << flba_data
+            };
+
+            // TODO: check metadata?
+            let namespace = Namespace {
+                id: namespace_id,
+                blocks: namespace_data.namespace_capacity,
+                block_size,
+            };
+            debug!("{namespace:?}");
+            namespaces.insert(namespace_id, namespace);
+        }
+
+        Ok(Self {
+            allocator: Arc::new(allocator),
+            address,
+            doorbell_stride,
+            length,
+            admin_queue_pair,
+            io_queue_pair_ids: Vec::new(),
+            buffer,
+            information,
+            namespaces,
+        })
+    }
+
+    pub fn controller_information(&self) -> &ControllerInformation {
+        &self.information
+    }
+
+    pub fn namespace_ids(&self) -> Vec<NamespaceId> {
+        self.namespaces.keys().copied().collect()
+    }
+
+    pub fn namespace(&self, namespace_id: &NamespaceId) -> Result<&Namespace, Error> {
+        self.namespaces
+            .get(namespace_id)
+            .ok_or(Error::NamespaceDoesNotExist(*namespace_id))
+    }
+
+    /// Create a pair consisting of 1 submission and 1 completion queue.
+    pub fn create_io_queue_pair(
+        &mut self,
+        namespace_id: &NamespaceId,
+        number_of_queue_entries: u32,
+    ) -> Result<IoQueuePair<A>, Error> {
+        if number_of_queue_entries < 2 {
+            return Err(Error::NumberOfQueueEntriesLessThanTwo(
+                number_of_queue_entries,
+            ));
+        }
+        if number_of_queue_entries > self.information.maximum_queue_entries_supported {
+            return Err(Error::NumberOfQueueEntriesMoreThanMaximum(
+                number_of_queue_entries,
+                self.information.maximum_queue_entries_supported,
+            ));
+        }
+        let namespace = *self.namespace(namespace_id)?;
+
+        // Simple way to avoid collisions while reusing some previously deleted keys.
+        let mut index_option = None;
+        for i in 1..=self.information.maximum_number_of_io_queue_pairs {
+            if !self.io_queue_pair_ids.contains(&IoQueuePairId(i)) {
+                index_option = Some(IoQueuePairId(i));
+                break;
+            }
+        }
+        let queue_id = index_option.ok_or(Error::MaximumNumberOfQueuesReached)?;
+
+        debug!("Requesting I/O queue pair with ID {}", queue_id.0);
+
+        let offset = 0x1000 + ((4 << self.doorbell_stride) * (2 * queue_id.0 + 1) as usize);
+        assert!(
+            offset <= self.length - 4,
+            "SQ doorbell offset out of bounds"
+        );
+
+        let dbl = self.address as usize + offset;
+        let completion_queue = CompletionQueue::new(
+            number_of_queue_entries as usize,
+            self.information.memory_page_size,
+            dbl,
+            self.allocator.as_ref(),
+        )?;
+        self.submit_and_complete_admin(|c_id, _| {
+            NvmeCommand::create_io_completion_queue(
+                c_id,
+                queue_id.0,
+                completion_queue.get_addr(),
+                (number_of_queue_entries - 1) as u16,
+            )
+        })?;
+
+        let dbl = self.address as usize
+            + 0x1000
+            + ((4 << self.doorbell_stride) * (2 * queue_id.0) as usize);
+        let submission_queue = SubmissionQueue::new(
+            number_of_queue_entries as usize,
+            self.information.memory_page_size,
+            dbl,
+            self.allocator.as_ref(),
+        )?;
+        self.submit_and_complete_admin(|c_id, _| {
+            NvmeCommand::create_io_submission_queue(
+                c_id,
+                queue_id.0,
+                submission_queue.get_addr(),
+                (number_of_queue_entries - 1) as u16,
+                queue_id.0,
+            )
+        })?;
+
+        let io_queue_pair = IoQueuePair {
+            id: queue_id,
+            submission: submission_queue,
+            completion: completion_queue,
+            page_size: self.information.memory_page_size,
+            maximum_transfer_size: self.information.maximum_transfer_size,
+            allocator: self.allocator.clone(),
+            namespace,
+            device_address: self.address as usize,
+            doorbell_stride: self.doorbell_stride,
+            prp_containers: HashMap::with_hasher(RandomState::with_seeds(0, 0, 0, 0)),
+        };
+        self.io_queue_pair_ids.push(queue_id);
+        Ok(io_queue_pair)
+    }
+
+    pub fn delete_io_queue_pair(&mut self, queue_pair: IoQueuePair<A>) -> Result<(), Error> {
+        debug!("Deleting I/O queue pair with ID {}", queue_pair.id.0);
+        let index = self
+            .io_queue_pair_ids
+            .iter()
+            .position(|id| id == &queue_pair.id)
+            .ok_or(Error::IoQueuePairDoesNotExist(queue_pair.id))?;
+        self.io_queue_pair_ids.remove(index);
+        self.submit_and_complete_admin(|c_id, _| {
+            NvmeCommand::delete_io_submission_queue(c_id, queue_pair.id.0)
+        })?;
+        self.submit_and_complete_admin(|c_id, _| {
+            NvmeCommand::delete_io_completion_queue(c_id, queue_pair.id.0)
+        })?;
+        Ok(())
+    }
+
+    pub fn clear_namespace(&mut self, namespace_id: &NamespaceId) -> Result<(), Error> {
+        self.admin_queue_pair
+            .submit_and_complete(
+                |command_id, _| NvmeCommand::format_nvm(command_id, namespace_id.0),
+                &self.buffer,
+                self.address,
+                self.doorbell_stride,
+            )
+            .map(|_| ())
+    }
+
+    /// This initiates a normal Memory-based Controller Shutdown (PCIe).
+    pub fn shutdown(mut self, all_io_queue_pairs: Vec<IoQueuePair<A>>) -> Result<(), Error> {
+        for io_queue_pair in all_io_queue_pairs {
+            self.delete_io_queue_pair(io_queue_pair)?;
+        }
+        self.buffer.deallocate(self.allocator.as_ref())?;
+
+        debug!("Send shutdown signal");
+        let mut cc = get_register_32(NvmeRegs32::CC, self.address, self.length)?;
+        // Set Shutdown (SHN) to 0b01
+        cc &= 0b1111_1111_1111_1111_0111_1111_1111_1111;
+        cc |= 0b0000_0000_0000_0000_0100_0000_0000_0000;
+        set_register_32(NvmeRegs32::CC, cc, self.address, self.length)?;
+
+        // Wait for "shutdown" signal
+        loop {
+            let csts = get_register_32(NvmeRegs32::CSTS, self.address, self.length)?;
+            let shutdown_status = (csts >> 2) & 0b11; // SHST
+            let shutdown_type = csts >> 7; // ST
+            if shutdown_status == 0b10 && shutdown_type == 0 {
+                break;
+            } else {
+                spin_loop();
+            }
+        }
+        debug!("Controller shutdown successful");
+        Ok(())
+    }
+
+    fn submit_and_complete_admin<F: FnOnce(u16, usize) -> NvmeCommand>(
+        &mut self,
+        cmd_init: F,
+    ) -> Result<CompletionQueueEntry, Error> {
+        self.admin_queue_pair.submit_and_complete(
+            cmd_init,
+            &self.buffer,
+            self.address,
+            self.doorbell_stride,
+        )
+    }
+}
+
+/// Gets the value of the register at `address` + `register`.
+/// Returns an error if `address` + `register` does not belong to mapped memory.
+fn get_register_32(register: NvmeRegs32, address: *mut u8, length: usize) -> Result<u32, Error> {
+    if register as usize > length - 4 {
+        return Err(Error::MemoryAccessOutOfBounds);
+    }
+    let value =
+        unsafe { core::ptr::read_volatile((address as usize + register as usize) as *mut u32) };
+    Ok(value)
+}
+
+/// Gets the value of the register at `address` + `register`.
+/// Returns an error if `address` + `register` does not belong to mapped memory.
+fn get_register_64(register: NvmeRegs64, address: *mut u8, length: usize) -> Result<u64, Error> {
+    if register as usize > length - 8 {
+        return Err(Error::MemoryAccessOutOfBounds);
+    }
+    let value =
+        unsafe { core::ptr::read_volatile((address as usize + register as usize) as *mut u64) };
+    Ok(value)
+}
+
+/// Sets the register at `address` + `register` to `value`.
+/// Returns an error if `address` + `register` does not belong to mapped memory.
+fn set_register_32(
+    register: NvmeRegs32,
+    value: u32,
+    address: *mut u8,
+    length: usize,
+) -> Result<(), Error> {
+    if register as usize > length - 4 {
+        return Err(Error::MemoryAccessOutOfBounds);
+    }
+    unsafe {
+        core::ptr::write_volatile((address as usize + register as usize) as *mut u32, value);
+    }
+    Ok(())
+}
+
+/// Sets the register at `address` + `register` to `value`.
+/// Returns an error if `address` + `register` does not belong to mapped memory.
+fn set_register_64(
+    register: NvmeRegs64,
+    value: u64,
+    address: *mut u8,
+    length: usize,
+) -> Result<(), Error> {
+    if register as usize > length - 8 {
+        return Err(Error::MemoryAccessOutOfBounds);
+    }
+    unsafe {
+        core::ptr::write_volatile((address as usize + register as usize) as *mut u64, value);
+    }
+    Ok(())
+}
 
 // clippy doesnt like this
 #[allow(unused, clippy::upper_case_acronyms)]
-#[derive(Copy, Clone, Debug)]
-pub enum NvmeRegs32 {
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum NvmeRegs32 {
     VS = 0x8,        // Version
     INTMS = 0xC,     // Interrupt Mask Set
     INTMC = 0x10,    // Interrupt Mask Clear
@@ -32,781 +640,11 @@ pub enum NvmeRegs32 {
 }
 
 #[allow(unused, clippy::upper_case_acronyms)]
-#[derive(Copy, Clone, Debug)]
-pub enum NvmeRegs64 {
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum NvmeRegs64 {
     CAP = 0x0,      // Controller Capabilities
     ASQ = 0x28,     // Admin Submission Queue Base Address
     ACQ = 0x30,     // Admin Completion Queue Base Address
     CMBMSC = 0x50,  // Controller Memory Buffer Space Control
     PMRMSC = 0xE14, // Persistent Memory Buffer Space Control
-}
-
-#[allow(non_camel_case_types)]
-#[derive(Copy, Clone, Debug)]
-pub(crate) enum NvmeArrayRegs {
-    SQyTDBL,
-    CQyHDBL,
-}
-
-// who tf is abbreviating this stuff
-#[repr(C, packed)]
-#[derive(Debug, Clone, Copy)]
-#[allow(unused)]
-struct IdentifyNamespaceData {
-    pub nsze: u64,
-    pub ncap: u64,
-    nuse: u64,
-    nsfeat: u8,
-    pub nlbaf: u8,
-    pub flbas: u8,
-    mc: u8,
-    dpc: u8,
-    dps: u8,
-    nmic: u8,
-    rescap: u8,
-    fpi: u8,
-    dlfeat: u8,
-    nawun: u16,
-    nawupf: u16,
-    nacwu: u16,
-    nabsn: u16,
-    nabo: u16,
-    nabspf: u16,
-    noiob: u16,
-    nvmcap: u128,
-    npwg: u16,
-    npwa: u16,
-    npdg: u16,
-    npda: u16,
-    nows: u16,
-    _rsvd1: [u8; 18],
-    anagrpid: u32,
-    _rsvd2: [u8; 3],
-    nsattr: u8,
-    nvmsetid: u16,
-    endgid: u16,
-    nguid: [u8; 16],
-    eui64: u64,
-    pub lba_format_support: [u32; 16],
-    _rsvd3: [u8; 192],
-    vendor_specific: [u8; 3712],
-}
-
-pub struct NvmeQueuePair {
-    pub id: u16,
-    pub sub_queue: NvmeSubQueue,
-    comp_queue: NvmeCompQueue,
-}
-
-impl NvmeQueuePair {
-    /// returns amount of requests pushed into submission queue
-    pub fn submit_io(&mut self, data: &impl DmaSlice, mut lba: u64, write: bool) -> usize {
-        let mut reqs = 0;
-        // TODO: contruct PRP list?
-        for chunk in data.chunks(2 * 4096) {
-            let blocks = (chunk.slice.len() as u64 + 512 - 1) / 512;
-
-            let addr = chunk.phys_addr as u64;
-            let bytes = blocks * 512;
-            let ptr1 = if bytes <= 4096 {
-                0
-            } else {
-                addr + 4096 // self.page_size
-            };
-
-            let entry = if write {
-                NvmeCommand::io_write(
-                    self.id << 11 | self.sub_queue.tail as u16,
-                    1,
-                    lba,
-                    blocks as u16 - 1,
-                    addr,
-                    ptr1,
-                )
-            } else {
-                NvmeCommand::io_read(
-                    self.id << 11 | self.sub_queue.tail as u16,
-                    1,
-                    lba,
-                    blocks as u16 - 1,
-                    addr,
-                    ptr1,
-                )
-            };
-
-            if let Some(tail) = self.sub_queue.submit_checked(entry) {
-                unsafe {
-                    std::ptr::write_volatile(self.sub_queue.doorbell as *mut u32, tail as u32);
-                }
-            } else {
-                eprintln!("queue full");
-                return reqs;
-            }
-
-            lba += blocks;
-            reqs += 1;
-        }
-        reqs
-    }
-
-    // TODO: maybe return result
-    pub fn complete_io(&mut self, n: usize) -> Option<u16> {
-        assert!(n > 0);
-        let (tail, c_entry, _) = self.comp_queue.complete_n(n);
-        unsafe {
-            std::ptr::write_volatile(self.comp_queue.doorbell as *mut u32, tail as u32);
-        }
-        self.sub_queue.head = c_entry.sq_head as usize;
-        let status = c_entry.status >> 1;
-        if status != 0 {
-            eprintln!(
-                "Status: 0x{:x}, Status Code 0x{:x}, Status Code Type: 0x{:x}",
-                status,
-                status & 0xFF,
-                (status >> 8) & 0x7
-            );
-            eprintln!("{:?}", c_entry);
-            return None;
-        }
-        Some(c_entry.sq_head)
-    }
-
-    pub fn quick_poll(&mut self) -> Option<()> {
-        if let Some((tail, c_entry, _)) = self.comp_queue.complete() {
-            unsafe {
-                std::ptr::write_volatile(self.comp_queue.doorbell as *mut u32, tail as u32);
-            }
-            self.sub_queue.head = c_entry.sq_head as usize;
-            let status = c_entry.status >> 1;
-            if status != 0 {
-                eprintln!(
-                    "Status: 0x{:x}, Status Code 0x{:x}, Status Code Type: 0x{:x}",
-                    status,
-                    status & 0xFF,
-                    (status >> 8) & 0x7
-                );
-                eprintln!("{:?}", c_entry);
-            }
-            return Some(());
-        }
-        None
-    }
-}
-
-#[allow(unused)]
-pub struct NvmeDevice {
-    pci_addr: String,
-    addr: *mut u8,
-    len: usize,
-    // Doorbell stride
-    dstrd: u16,
-    admin_sq: NvmeSubQueue,
-    admin_cq: NvmeCompQueue,
-    io_sq: NvmeSubQueue,
-    io_cq: NvmeCompQueue,
-    buffer: Dma<u8>,           // 2MiB of buffer
-    prp_list: Dma<[u64; 512]>, // Address of PRP's, devices doesn't necessarily support 2MiB page sizes; 8 Bytes * 512 = 4096
-    pub namespaces: HashMap<u32, NvmeNamespace>,
-    pub stats: NvmeStats,
-    q_id: u16,
-}
-
-// TODO
-unsafe impl Send for NvmeDevice {}
-unsafe impl Sync for NvmeDevice {}
-
-#[allow(unused)]
-impl NvmeDevice {
-    pub fn init(pci_addr: &str) -> Result<Self, Box<dyn Error>> {
-        let (addr, len) = pci_map_resource(pci_addr)?;
-        let mut dev = Self {
-            pci_addr: pci_addr.to_string(),
-            addr,
-            dstrd: {
-                unsafe {
-                    ((std::ptr::read_volatile(
-                        (addr as usize + NvmeRegs64::CAP as usize) as *const u64,
-                    ) >> 32)
-                        & 0b1111) as u16
-                }
-            },
-            len,
-            admin_sq: NvmeSubQueue::new(QUEUE_LENGTH, 0)?,
-            admin_cq: NvmeCompQueue::new(QUEUE_LENGTH, 0)?,
-            io_sq: NvmeSubQueue::new(QUEUE_LENGTH, 0)?,
-            io_cq: NvmeCompQueue::new(QUEUE_LENGTH, 0)?,
-            buffer: Dma::allocate(crate::memory::HUGE_PAGE_SIZE)?,
-            prp_list: Dma::allocate(8 * 512)?,
-            namespaces: HashMap::new(),
-            stats: NvmeStats::default(),
-            q_id: 1,
-        };
-
-        for i in 1..512 {
-            dev.prp_list[i - 1] = (dev.buffer.phys + i * 4096) as u64;
-        }
-
-        println!("CAP: 0x{:x}", dev.get_reg64(NvmeRegs64::CAP as u64));
-        println!("VS: 0x{:x}", dev.get_reg32(NvmeRegs32::VS as u32));
-        println!("CC: 0x{:x}", dev.get_reg32(NvmeRegs32::CC as u32));
-
-        println!("Disabling controller");
-        // Set Enable bit to 0
-        let ctrl_config = dev.get_reg32(NvmeRegs32::CC as u32) & 0xFFFF_FFFE;
-        dev.set_reg32(NvmeRegs32::CC as u32, ctrl_config);
-
-        // Wait for not ready
-        loop {
-            let csts = dev.get_reg32(NvmeRegs32::CSTS as u32);
-            if csts & 1 == 1 {
-                spin_loop();
-            } else {
-                break;
-            }
-        }
-
-        // Configure Admin Queues
-        dev.set_reg64(NvmeRegs64::ASQ as u32, dev.admin_sq.get_addr() as u64);
-        dev.set_reg64(NvmeRegs64::ACQ as u32, dev.admin_cq.get_addr() as u64);
-        dev.set_reg32(
-            NvmeRegs32::AQA as u32,
-            (QUEUE_LENGTH as u32 - 1) << 16 | (QUEUE_LENGTH as u32 - 1),
-        );
-
-        // Configure other stuff
-        // TODO: check css values
-        let mut cc = dev.get_reg32(NvmeRegs32::CC as u32);
-        // mask out reserved stuff
-        cc &= 0xFF00_000F;
-        // Set Completion (2^4 = 16 Bytes) and Submission Entry (2^6 = 64 Bytes) sizes
-        cc |= (4 << 20) | (6 << 16);
-
-        // Set Memory Page Size
-        // let mpsmax = ((dev.get_reg64(NvmeRegs64::CAP as u64) >> 52) & 0xF) as u32;
-        // cc |= (mpsmax << 7);
-        // println!("MPS {}", (cc >> 7) & 0xF);
-        dev.set_reg32(NvmeRegs32::CC as u32, cc);
-
-        // Enable the controller
-        println!("Enabling controller");
-        let ctrl_config = dev.get_reg32(NvmeRegs32::CC as u32) | 1;
-        dev.set_reg32(NvmeRegs32::CC as u32, ctrl_config);
-
-        // wait for ready
-        loop {
-            let csts = dev.get_reg32(NvmeRegs32::CSTS as u32);
-            if csts & 1 == 0 {
-                spin_loop();
-            } else {
-                break;
-            }
-        }
-
-        let q_id = dev.q_id;
-        let addr = dev.io_cq.get_addr();
-        println!("Requesting i/o completion queue");
-        let comp = dev.submit_and_complete_admin(|c_id, _| {
-            NvmeCommand::create_io_completion_queue(c_id, q_id, addr, (QUEUE_LENGTH - 1) as u16)
-        })?;
-        let addr = dev.io_sq.get_addr();
-        println!("Requesting i/o submission queue");
-        let comp = dev.submit_and_complete_admin(|c_id, _| {
-            NvmeCommand::create_io_submission_queue(
-                c_id,
-                q_id,
-                addr,
-                (QUEUE_LENGTH - 1) as u16,
-                q_id,
-            )
-        })?;
-        dev.q_id += 1;
-
-        Ok(dev)
-    }
-
-    pub fn identify_controller(&mut self) -> Result<(), Box<dyn Error>> {
-        println!("Trying to identify controller");
-        let _entry = self.submit_and_complete_admin(NvmeCommand::identify_controller);
-
-        println!("Dumping identify controller");
-        let mut serial = String::new();
-        let data = &self.buffer;
-
-        for &b in &data[4..24] {
-            if b == 0 {
-                break;
-            }
-            serial.push(b as char);
-        }
-
-        let mut model = String::new();
-        for &b in &data[24..64] {
-            if b == 0 {
-                break;
-            }
-            model.push(b as char);
-        }
-
-        let mut firmware = String::new();
-        for &b in &data[64..72] {
-            if b == 0 {
-                break;
-            }
-            firmware.push(b as char);
-        }
-
-        println!(
-            "  - Model: {} Serial: {} Firmware: {}",
-            model.trim(),
-            serial.trim(),
-            firmware.trim()
-        );
-
-        Ok(())
-    }
-
-    // 1 to 1 Submission/Completion Queue Mapping
-    pub fn create_io_queue_pair(&mut self, len: usize) -> Result<NvmeQueuePair, Box<dyn Error>> {
-        let q_id = self.q_id;
-        println!("Requesting i/o queue pair with id {q_id}");
-
-        let offset = 0x1000 + ((4 << self.dstrd) * (2 * q_id + 1) as usize);
-        assert!(offset <= self.len - 4, "SQ doorbell offset out of bounds");
-
-        let dbl = self.addr as usize + offset;
-
-        let comp_queue = NvmeCompQueue::new(len, dbl)?;
-        let comp = self.submit_and_complete_admin(|c_id, _| {
-            NvmeCommand::create_io_completion_queue(
-                c_id,
-                q_id,
-                comp_queue.get_addr(),
-                (len - 1) as u16,
-            )
-        })?;
-
-        let dbl = self.addr as usize + 0x1000 + ((4 << self.dstrd) * (2 * q_id) as usize);
-        let sub_queue = NvmeSubQueue::new(len, dbl)?;
-        let comp = self.submit_and_complete_admin(|c_id, _| {
-            NvmeCommand::create_io_submission_queue(
-                c_id,
-                q_id,
-                sub_queue.get_addr(),
-                (len - 1) as u16,
-                q_id,
-            )
-        })?;
-
-        self.q_id += 1;
-        Ok(NvmeQueuePair {
-            id: q_id,
-            sub_queue,
-            comp_queue,
-        })
-    }
-
-    pub fn delete_io_queue_pair(&mut self, qpair: NvmeQueuePair) -> Result<(), Box<dyn Error>> {
-        println!("Deleting i/o queue pair with id {}", qpair.id);
-        self.submit_and_complete_admin(|c_id, _| {
-            NvmeCommand::delete_io_submission_queue(c_id, qpair.id)
-        })?;
-        self.submit_and_complete_admin(|c_id, _| {
-            NvmeCommand::delete_io_completion_queue(c_id, qpair.id)
-        })?;
-        Ok(())
-    }
-
-    pub fn identify_namespace_list(&mut self, base: u32) -> Vec<u32> {
-        self.submit_and_complete_admin(|c_id, addr| {
-            NvmeCommand::identify_namespace_list(c_id, addr, base)
-        });
-
-        // TODO: idk bout this/don't hardcode len
-        let data: &[u32] =
-            unsafe { std::slice::from_raw_parts(self.buffer.virt as *const u32, 1024) };
-
-        data.iter()
-            .copied()
-            .take_while(|&id| id != 0)
-            .collect::<Vec<u32>>()
-    }
-
-    pub fn identify_namespace(&mut self, id: u32) -> NvmeNamespace {
-        self.submit_and_complete_admin(|c_id, addr| {
-            NvmeCommand::identify_namespace(c_id, addr, id)
-        });
-
-        let namespace_data: IdentifyNamespaceData =
-            unsafe { *(self.buffer.virt as *const IdentifyNamespaceData) };
-
-        // let namespace_data = unsafe { *tmp_buff.virt };
-        let size = namespace_data.nsze;
-        let blocks = namespace_data.ncap;
-
-        // figure out block size
-        let flba_idx = (namespace_data.flbas & 0xF) as usize;
-        let flba_data = (namespace_data.lba_format_support[flba_idx] >> 16) & 0xFF;
-        let block_size = if !(9..32).contains(&flba_data) {
-            0
-        } else {
-            1 << flba_data
-        };
-
-        // TODO: check metadata?
-        println!("Namespace {id}, Size: {size}, Blocks: {blocks}, Block size: {block_size}");
-
-        let namespace = NvmeNamespace {
-            id,
-            blocks,
-            block_size,
-        };
-        self.namespaces.insert(id, namespace);
-        namespace
-    }
-
-    // TODO: currently namespace 1 is hardcoded
-    pub fn write(&mut self, data: &impl DmaSlice, mut lba: u64) -> Result<(), Box<dyn Error>> {
-        for chunk in data.chunks(2 * 4096) {
-            let blocks = (chunk.slice.len() as u64 + 512 - 1) / 512;
-            self.namespace_io(1, blocks, lba, chunk.phys_addr as u64, true)?;
-            lba += blocks;
-        }
-
-        Ok(())
-    }
-
-    pub fn read(&mut self, dest: &impl DmaSlice, mut lba: u64) -> Result<(), Box<dyn Error>> {
-        // let ns = *self.namespaces.get(&1).unwrap();
-        for chunk in dest.chunks(2 * 4096) {
-            let blocks = (chunk.slice.len() as u64 + 512 - 1) / 512;
-            self.namespace_io(1, blocks, lba, chunk.phys_addr as u64, false)?;
-            lba += blocks;
-        }
-        Ok(())
-    }
-
-    pub fn write_copied(&mut self, data: &[u8], mut lba: u64) -> Result<(), Box<dyn Error>> {
-        let ns = *self.namespaces.get(&1).unwrap();
-        for chunk in data.chunks(128 * 4096) {
-            self.buffer[..chunk.len()].copy_from_slice(chunk);
-            let blocks = (chunk.len() as u64 + ns.block_size - 1) / ns.block_size;
-            self.namespace_io(1, blocks, lba, self.buffer.phys as u64, true)?;
-            lba += blocks;
-        }
-
-        Ok(())
-    }
-
-    pub fn read_copied(
-        &mut self,
-        dest: &mut [u8],
-        mut lba: u64,
-    ) -> Result<(), Box<dyn Error>> {
-        let ns = *self.namespaces.get(&1).unwrap();
-        for chunk in dest.chunks_mut(128 * 4096) {
-            let blocks = (chunk.len() as u64 + ns.block_size - 1) / ns.block_size;
-            self.namespace_io(1, blocks, lba, self.buffer.phys as u64, false)?;
-            lba += blocks;
-            chunk.copy_from_slice(&self.buffer[..chunk.len()]);
-        }
-        Ok(())
-    }
-
-    fn submit_io(
-        &mut self,
-        ns: &NvmeNamespace,
-        addr: u64,
-        blocks: u64,
-        lba: u64,
-        write: bool,
-    ) -> Option<usize> {
-        assert!(blocks > 0);
-        assert!(blocks <= 0x1_0000);
-        let q_id = 1;
-
-        let bytes = blocks * ns.block_size;
-        let ptr1 = if bytes <= 4096 {
-            0
-        } else if bytes <= 8192 {
-            addr + 4096 // self.page_size
-        } else {
-            // idk if this works
-            let offset = (addr - self.buffer.phys as u64) / 8;
-            self.prp_list.phys as u64 + offset
-        };
-
-        let entry = if write {
-            NvmeCommand::io_write(
-                self.io_sq.tail as u16,
-                ns.id,
-                lba,
-                blocks as u16 - 1,
-                addr,
-                ptr1,
-            )
-        } else {
-            NvmeCommand::io_read(
-                self.io_sq.tail as u16,
-                ns.id,
-                lba,
-                blocks as u16 - 1,
-                addr,
-                ptr1,
-            )
-        };
-        self.io_sq.submit_checked(entry)
-    }
-
-    fn complete_io(&mut self, step: u64) -> Option<u16> {
-        let q_id = 1;
-
-        let (tail, c_entry, _) = self.io_cq.complete_n(step as usize);
-        self.write_reg_idx(NvmeArrayRegs::CQyHDBL, q_id as u16, tail as u32);
-
-        let status = c_entry.status >> 1;
-        if status != 0 {
-            eprintln!(
-                "Status: 0x{:x}, Status Code 0x{:x}, Status Code Type: 0x{:x}",
-                status,
-                status & 0xFF,
-                (status >> 8) & 0x7
-            );
-            eprintln!("{:?}", c_entry);
-            return None;
-        }
-        self.stats.completions += 1;
-        Some(c_entry.sq_head)
-    }
-
-    pub fn batched_write(
-        &mut self,
-        ns_id: u32,
-        data: &[u8],
-        mut lba: u64,
-        batch_len: u64,
-    ) -> Result<(), Box<dyn Error>> {
-        let ns = *self.namespaces.get(&ns_id).unwrap();
-        let block_size = 512;
-        let q_id = 1;
-
-        for chunk in data.chunks(HUGE_PAGE_SIZE) {
-            self.buffer[..chunk.len()].copy_from_slice(chunk);
-            let tail = self.io_sq.tail;
-
-            let batch_len = std::cmp::min(batch_len, chunk.len() as u64 / block_size);
-            let batch_size = chunk.len() as u64 / batch_len;
-            let blocks = batch_size / ns.block_size;
-
-            for i in 0..batch_len {
-                if let Some(tail) = self.submit_io(
-                    &ns,
-                    self.buffer.phys as u64 + i * batch_size,
-                    blocks,
-                    lba,
-                    true,
-                ) {
-                    self.stats.submissions += 1;
-                    self.write_reg_idx(NvmeArrayRegs::SQyTDBL, q_id as u16, tail as u32);
-                } else {
-                    eprintln!("tail: {tail}, batch_len: {batch_len}, batch_size: {batch_size}, blocks: {blocks}");
-                }
-                lba += blocks;
-            }
-            self.io_sq.head = self.complete_io(batch_len).unwrap() as usize;
-        }
-
-        Ok(())
-    }
-
-    pub fn batched_read(
-        &mut self,
-        ns_id: u32,
-        data: &mut [u8],
-        mut lba: u64,
-        batch_len: u64,
-    ) -> Result<(), Box<dyn Error>> {
-        let ns = *self.namespaces.get(&ns_id).unwrap();
-        let block_size = 512;
-        let q_id = 1;
-
-        for chunk in data.chunks_mut(HUGE_PAGE_SIZE) {
-            let tail = self.io_sq.tail;
-
-            let batch_len = std::cmp::min(batch_len, chunk.len() as u64 / block_size);
-            let batch_size = chunk.len() as u64 / batch_len;
-            let blocks = batch_size / ns.block_size;
-
-            for i in 0..batch_len {
-                if let Some(tail) = self.submit_io(
-                    &ns,
-                    self.buffer.phys as u64 + i * batch_size,
-                    blocks,
-                    lba,
-                    false,
-                ) {
-                    self.stats.submissions += 1;
-                    self.write_reg_idx(NvmeArrayRegs::SQyTDBL, q_id as u16, tail as u32);
-                } else {
-                    eprintln!("tail: {tail}, batch_len: {batch_len}, batch_size: {batch_size}, blocks: {blocks}");
-                }
-                lba += blocks;
-            }
-            self.io_sq.head = self.complete_io(batch_len).unwrap() as usize;
-            chunk.copy_from_slice(&self.buffer[..chunk.len()]);
-        }
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn namespace_io(
-        &mut self,
-        ns_id: u32,
-        blocks: u64,
-        lba: u64,
-        addr: u64,
-        write: bool,
-    ) -> Result<(), Box<dyn Error>> {
-        assert!(blocks > 0);
-        assert!(blocks <= 0x1_0000);
-
-        let q_id = 1;
-
-        let bytes = blocks * 512;
-        let ptr1 = if bytes <= 4096 {
-            0
-        } else if bytes <= 8192 {
-            // self.buffer.phys as u64 + 4096 // self.page_size
-            addr + 4096 // self.page_size
-        } else {
-            self.prp_list.phys as u64
-        };
-
-        let entry = if write {
-            NvmeCommand::io_write(
-                self.io_sq.tail as u16,
-                ns_id,
-                lba,
-                blocks as u16 - 1,
-                addr,
-                ptr1,
-            )
-        } else {
-            NvmeCommand::io_read(
-                self.io_sq.tail as u16,
-                ns_id,
-                lba,
-                blocks as u16 - 1,
-                addr,
-                ptr1,
-            )
-        };
-
-        let tail = self.io_sq.submit(entry);
-        self.stats.submissions += 1;
-
-        self.write_reg_idx(NvmeArrayRegs::SQyTDBL, q_id as u16, tail as u32);
-        self.io_sq.head = self.complete_io(1).unwrap() as usize;
-        Ok(())
-    }
-
-    fn submit_and_complete_admin<F: FnOnce(u16, usize) -> NvmeCommand>(
-        &mut self,
-        cmd_init: F,
-    ) -> Result<NvmeCompletion, Box<dyn Error>> {
-        let cid = self.admin_sq.tail;
-        let tail = self.admin_sq.submit(cmd_init(cid as u16, self.buffer.phys));
-        self.write_reg_idx(NvmeArrayRegs::SQyTDBL, 0, tail as u32);
-
-        let (head, entry, _) = self.admin_cq.complete_spin();
-        self.write_reg_idx(NvmeArrayRegs::CQyHDBL, 0, head as u32);
-        let status = entry.status >> 1;
-        if status != 0 {
-            eprintln!(
-                "Status: 0x{:x}, Status Code 0x{:x}, Status Code Type: 0x{:x}",
-                status,
-                status & 0xFF,
-                (status >> 8) & 0x7
-            );
-            return Err("Requesting i/o completion queue failed".into());
-        }
-        Ok(entry)
-    }
-
-    pub fn clear_namespace(&mut self, ns_id: Option<u32>) {
-        let ns_id = if let Some(ns_id) = ns_id {
-            assert!(self.namespaces.contains_key(&ns_id));
-            ns_id
-        } else {
-            0xFFFF_FFFF
-        };
-        self.submit_and_complete_admin(|c_id, _| NvmeCommand::format_nvm(c_id, ns_id));
-    }
-
-    /// Sets Queue `qid` Tail Doorbell to `val`
-    fn write_reg_idx(&self, reg: NvmeArrayRegs, qid: u16, val: u32) {
-        match reg {
-            NvmeArrayRegs::SQyTDBL => unsafe {
-                std::ptr::write_volatile(
-                    (self.addr as usize + 0x1000 + ((4 << self.dstrd) * (2 * qid)) as usize)
-                        as *mut u32,
-                    val,
-                );
-            },
-            NvmeArrayRegs::CQyHDBL => unsafe {
-                std::ptr::write_volatile(
-                    (self.addr as usize + 0x1000 + ((4 << self.dstrd) * (2 * qid + 1)) as usize)
-                        as *mut u32,
-                    val,
-                );
-            },
-        }
-    }
-
-    /// Sets the register at `self.addr` + `reg` to `value`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `self.addr` + `reg` does not belong to the mapped memory of the pci device.
-    fn set_reg32(&self, reg: u32, value: u32) {
-        assert!(reg as usize <= self.len - 4, "memory access out of bounds");
-
-        unsafe {
-            std::ptr::write_volatile((self.addr as usize + reg as usize) as *mut u32, value);
-        }
-    }
-
-    /// Returns the register at `self.addr` + `reg`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `self.addr` + `reg` does not belong to the mapped memory of the pci device.
-    fn get_reg32(&self, reg: u32) -> u32 {
-        assert!(reg as usize <= self.len - 4, "memory access out of bounds");
-
-        unsafe { std::ptr::read_volatile((self.addr as usize + reg as usize) as *mut u32) }
-    }
-
-    /// Sets the register at `self.addr` + `reg` to `value`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `self.addr` + `reg` does not belong to the mapped memory of the pci device.
-    fn set_reg64(&self, reg: u32, value: u64) {
-        assert!(reg as usize <= self.len - 8, "memory access out of bounds");
-
-        unsafe {
-            std::ptr::write_volatile((self.addr as usize + reg as usize) as *mut u64, value);
-        }
-    }
-
-    /// Returns the register at `self.addr` + `reg`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `self.addr` + `reg` does not belong to the mapped memory of the pci device.
-    fn get_reg64(&self, reg: u64) -> u64 {
-        assert!(reg as usize <= self.len - 8, "memory access out of bounds");
-
-        unsafe { std::ptr::read_volatile((self.addr as usize + reg as usize) as *mut u64) }
-    }
 }
