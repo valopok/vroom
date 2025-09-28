@@ -66,6 +66,11 @@ pub(crate) fn allocate<A: Allocator, T>(
         return Ok(PrpContainer::Two(prp_1 as usize, prp_2 as usize));
     }
 
+    // FIXME: multiple PRPs do not seem to work
+    if needed_number_of_pages > 2 {
+        return Err(Error::PrpMultipleNotSupported);
+    }
+
     let prp_entries_per_page = page_size / core::mem::size_of::<u64>();
     // subtracting 1 from the needed number of pages, because PRP1 points to the first needed page
     // subtracting 1 from the PRP entries per page, because one entry is needed as a pointer to the next PRP list

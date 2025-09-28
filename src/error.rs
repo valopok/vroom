@@ -36,6 +36,7 @@ pub enum Error {
     SubmissionQueueFull,
     CompletionQueueCompletionFailure,
     PrpContainerAlreadyExists(u16),
+    PrpMultipleNotSupported, // FIXME: remove error once supported
 }
 
 impl fmt::Display for Error {
@@ -120,6 +121,7 @@ impl fmt::Display for Error {
             Error::PrpContainerAlreadyExists(command_id) => write!(f,
                 "PRP container already exists for the command ID {command_id}."
             ),
+            Error::PrpMultipleNotSupported => write!(f, "The buffer is bigger than the currently supported maximum of 2 pages."),
         }
     }
 }
